@@ -38,10 +38,10 @@ class Dataframe_Manager():
         # CSVファイル(input_data2022.csv)から学習データを読み込む
         # 読み込む行を列名で指定：year,month,day,hour, PVout, price, imbalance  
      
-        # df_traindata = pd.read_csv("Battery-Control-By-Reinforcement-Learning/input_data2022.csv",
-        #                            usecols=["year","month","day","hour","PVout","price","imbalance"])  
-        df_traindata = pd.read_csv("Battery-Control-By-Reinforcement-Learning/train_data/input_data2022_edited.csv",
-                                   usecols=["year","month","day","hour","PVout","price","imbalance"])      
+        df_traindata = pd.read_csv("Battery-Control-By-Reinforcement-Learning/train_data/only0905_PV4.csv",
+                                   usecols=["year","month","day","hour","PVout","price","imbalance"])  
+        # df_traindata = pd.read_csv("Battery-Control-By-Reinforcement-Learning/train_data/input_data2022_edited.csv",
+        #                            usecols=["year","month","day","hour","PVout","price","imbalance"])      
         return df_traindata
 
     def get_test_df_bid(self):
