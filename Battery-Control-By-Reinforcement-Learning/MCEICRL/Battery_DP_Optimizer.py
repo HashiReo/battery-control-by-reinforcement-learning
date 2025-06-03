@@ -218,9 +218,9 @@ if __name__ == "__main__":
     parser.add_argument("--date", type=str, default="2022-09-04", help="Target date YYYY-MM-DD")
     parser.add_argument("--fig-dir", type=Path, default="Battery-Control-By-Reinforcement-Learning/MCEICRL/DP_PLOT", help="動的計画法で得たグラフの保存先")
     parser.add_argument("--save-pkl", type=Path, default="Battery-Control-By-Reinforcement-Learning/MCEICRL/EXPERT", help="動的計画法で得たobsとactionのpkl保存先")
-    ## --------------------------------------------
+    # --------------------------------------------
     # 正規化用パラメータ
-    ## --------------------------------------------
+    # --------------------------------------------
     parser.add_argument("--pv-max", type=float, default=2.0)
     parser.add_argument("--pv-min", type=float, default=0.0)
     parser.add_argument("--price-max", type=float, default=200.0)

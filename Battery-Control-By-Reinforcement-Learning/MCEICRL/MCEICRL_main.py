@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 import numpy as np
 from collections import deque
 import gym
@@ -8,6 +9,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard.writer import SummaryWriter
 import pickle
+from datetime import datetime, timedelta
 from tqdm import tqdm, trange
 from stable_baselines3.common.buffers import ReplayBuffer
 from MCEICRL_env import BatteryEnv
@@ -97,9 +99,10 @@ class MCEICRLTrainer:
         self.n_iters = config.n_iters
 
         self.battery_capacity = config.battery_capacity # 蓄電池の容量
-        self.num_rollouts = config.num_rollouts # エキスパートのロールアウト数
         self.num_nominal_trajectories = config.num_nominal_trajectories # nominal policyのロールアウト数
         self.expert_path = config.expert_path # エキスパートのデータパス
+        self.expert_start = datetime.strptime(config.expert_start_date, "%Y-%m-%d")
+        self.expert_end   = datetime.strptime(config.expert_end_date,   "%Y-%m-%d")
 
         # π(a|s)ネットワーク
         self.policy = GaussianPolicy(obs_dim, act_dim, self.battery_capacity).to(self.device)
@@ -196,7 +199,7 @@ class MCEICRLTrainer:
             # rolloutからpolicy_phiを計算
             # policy_obs, policy_acs = zip(*rollout) # (s, a)のリスト, 状態と行動のリストを分離
             policy_phi = self._compute_feature_expectation_from_nominal_trajectories() # nominal policyの軌道特徴量期待値を計算
-            expert_phi = self._compute_feature_expectation_from_expert_trajectories(self.num_rollouts, self.expert_path) # エキスパートの特徴量期待値を計算
+            expert_phi = self._compute_feature_expectation_from_expert_trajectories() # エキスパートの特徴量期待値を計算
 
             # dual λの更新
             self.update_lambda(expert_phi, policy_phi) # ラグランジュ乗数を更新
@@ -268,27 +271,44 @@ class MCEICRLTrainer:
             total_feature += discounted_sum
         return total_feature / num_trajectories
        
-    def _compute_feature_expectation_from_expert_trajectories(self, num_rollouts, expert_path, gamma = 0.99):
+    def _compute_feature_expectation_from_expert_trajectories(self, gamma = 0.99):
         """
         Trajectoriesから軌道特徴量期待値(E_π[φ_ζ(τ)])を計算
         input: trajectories: list of trajectories
         output: E_π or E_D[φ_ζ(τ)] : 期待値
         """
         total_feature = torch.zeros(self.feature_dim, device = self.device)
-        for i in range(num_rollouts): # 軌道数 i=1,2,...,N
-            discounted_sum = torch.zeros(self.feature_dim, device = self.device)
-            # with open(os.path.join(expert_path, "%s.pkl"%str(i)), 'rb') as f:
-            with open(os.path.join(expert_path, "2022-09-04_dp.pkl"), 'rb') as f:
-                data = pickle.load(f)
-            obs= data['observations']
-            acts= data['actions']
-            for t in range(len(obs)): # t=0,...,47(48ステップ)
-                s_t = torch.tensor(obs[t], dtype = torch.float32, device = self.device)
-                a_t = torch.tensor(acts[t], dtype = torch.float32, device = self.device)
-                phi_zeta = self.zeta_net(s_t, a_t)
-                discounted_sum += (gamma ** t) * phi_zeta
-            total_feature += discounted_sum
-        return total_feature / num_rollouts 
+        expert_num_rollouts = 0
+
+        current = self.expert_start
+        while current <= self.expert_end:
+            date_str = current.strftime("%Y-%m-%d")
+            file_name = f"{date_str}_dp.pkl"
+            file_path = os.path.join(self.expert_path, file_name)
+            if os.path.isfile(file_path):
+                with open(os.path.join(self.expert_path, "2022-09-04_dp.pkl"), 'rb') as f:
+                    data = pickle.load(f)
+                obs = data['observations']
+                acts = data['actions']
+                discounted_sum = torch.zeros(self.feature_dim, device = self.device)
+                for t in range(len(obs)): # t=0,...,47(48ステップ)
+                    s_t = torch.tensor(obs[t], dtype = torch.float32, device = self.device)
+                    a_t = torch.tensor(acts[t], dtype = torch.float32, device = self.device)
+                    phi_zeta = self.zeta_net(s_t, a_t)
+                    discounted_sum += (gamma ** t) * phi_zeta
+                total_feature += discounted_sum
+                expert_num_rollouts += 1
+            current += timedelta(days=1) # 日付を1日進める
+
+            if expert_num_rollouts == 0:
+                sys.stderr.write(
+                    f"Error: 指定された日付範囲 {self.expert_start.strftime('%Y-%m-%d')}〜"
+                    f"{self.expert_end.strftime('%Y-%m-%d')} の間に"
+                    f"一件も「*_dp.pkl」ファイルが見つかりませんでした。\n"
+                )
+                sys.exit(1)
+
+        return total_feature / expert_num_rollouts
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -312,8 +332,9 @@ if __name__ == '__main__':
     parser.add_argument('--alpha_k', type=float, default=0.01, help="制約閾値 αₖ（ϕ の許容差）")
     parser.add_argument('--zeta_lr', type=float, default=3e-4, help="ζ ネットワークの学習率")
     parser.add_argument('--expert_path', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/EXPERT')
-    parser.add_argument('--num_rollouts', type=int, default=1, help="エキスパートのロールアウト数")
-    parser.add_argument('--num_nominal_trajectories', type=int, default=3, help="nominal policyのロールアウト数")
+    parser.add_argument('--num_nominal_trajectories', type=int, default=10, help="nominal policyのロールアウト数")
+    parser.add_argument('--expert_start_date', type=str, default='2022-09-01', help="エキスパートデータの開始日")
+    parser.add_argument('--expert_end_date', type=str, default='2022-09-02', help="エキスパートデータの終了日")
     # Constraint Net 設定
     # parser.add_argument('--cn_layers', nargs='*', type=int, default=[64,64])
     # parser.add_argument('--cn_batch_size', type=int, default=64)
