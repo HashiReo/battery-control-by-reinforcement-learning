@@ -2,7 +2,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import torch
-from MCEICRL_utils import get_time_data, normalize, denormalize, make_random_state
+from MCEICRL_utils import get_time_data, normalize, denormalize, make_random_state, get_train_df
 from MCEICRL_net import FeatureEncoder
 from typing import List, Tuple
 import os, sys
@@ -24,9 +24,8 @@ class BatteryEnv(gym.Env):
         self.action_space = spaces.Box(low=-battery_capacity*0.5, high=battery_capacity*0.5, shape=(act_dim, ), dtype=np.float32)
         self.observation_space = spaces.Box(low = low, high = high, shape = (obs_dim, ), dtype=np.float32)
 
-        # データ読込みクラスのインスタンス化
-        self.dfmanager = Dataframe_Manager()
-        self.df_train = self.dfmanager.get_train_df()
+        # 学習用データフレームの取得
+        self.df_train = get_train_df()
         # self.pvout_max = self.df_train['PVout'].max()
         # self.pvout_min = self.df_train['PVout'].min()
         # self.price_max = self.df_train['price'].max()

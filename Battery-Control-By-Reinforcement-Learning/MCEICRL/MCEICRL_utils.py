@@ -4,6 +4,7 @@ import numpy as np
 import pickle
 from typing import List, Tuple, Any
 import os
+import pandas as pd
 
 
 # ==============================================================================
@@ -96,3 +97,10 @@ def operate_action(PV, action, current_soc, battery_capacity):
     action_difference = abs(action - edited_action)
 
     return edited_action, next_soc, action_difference
+
+def get_train_df():
+        # 読み込む行を列名で指定：year,month,day,hour, PVout, price, imbalance  
+        # 学習用データを指定
+        df_traindata = pd.read_csv("Battery-Control-By-Reinforcement-Learning/MCEICRL/train_data_for_ICRL/only0905_PV4.csv",
+                                   usecols=["year","month","day","hour","PVout","price","imbalance"])      
+        return df_traindata

@@ -333,8 +333,8 @@ if __name__ == '__main__':
     parser.add_argument('--zeta_lr', type=float, default=3e-4, help="ζ ネットワークの学習率")
     parser.add_argument('--expert_path', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/EXPERT')
     parser.add_argument('--num_nominal_trajectories', type=int, default=10, help="nominal policyのロールアウト数")
-    parser.add_argument('--expert_start_date', type=str, default='2022-09-01', help="エキスパートデータの開始日")
-    parser.add_argument('--expert_end_date', type=str, default='2022-09-02', help="エキスパートデータの終了日")
+    parser.add_argument('--expert_start_date', type=str, default='2022-09-04', help="エキスパートデータの開始日")
+    parser.add_argument('--expert_end_date', type=str, default='2022-09-04', help="エキスパートデータの終了日")
     # Constraint Net 設定
     # parser.add_argument('--cn_layers', nargs='*', type=int, default=[64,64])
     # parser.add_argument('--cn_batch_size', type=int, default=64)
