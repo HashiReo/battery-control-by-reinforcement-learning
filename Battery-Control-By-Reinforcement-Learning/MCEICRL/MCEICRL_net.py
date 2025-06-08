@@ -73,7 +73,8 @@ class GaussianPolicy(nn.Module):
         max_discharge = torch.minimum(soc*self.battery_capacity, torch.full_like(soc, self.battery_capacity*0.5))
         ## ---------------------------------------------
         scale = torch.where(yt_mean < 0, max_charge, max_discharge)
-        return yt_mean * scale
+        action = yt_mean * scale
+        return action.squeeze(0)
 
 # Q(s,a)
 class QNetwork(nn.Module):

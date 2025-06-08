@@ -1,6 +1,7 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
+import pandas as pd
 import torch
 from MCEICRL_utils import get_time_data, normalize, denormalize, make_random_state, get_train_df
 from MCEICRL_net import FeatureEncoder
@@ -12,7 +13,7 @@ sys.path.insert(0,parent_dir)
 from RL_dataframe_manager import Dataframe_Manager
 
 class BatteryEnv(gym.Env):
-    def __init__(self, battery_capacity, day_steps, obs_dim, act_dim, feature_dim):
+    def __init__(self, battery_capacity, day_steps, obs_dim, act_dim, feature_dim, train_data_path):
         super().__init__()
         self.day_steps = day_steps
         low = np.array([-np.inf] * obs_dim)
@@ -25,7 +26,9 @@ class BatteryEnv(gym.Env):
         self.observation_space = spaces.Box(low = low, high = high, shape = (obs_dim, ), dtype=np.float32)
 
         # 学習用データフレームの取得
-        self.df_train = get_train_df()
+        self.df_train = get_train_df(train_data_path)
+        # 推論用データフレーム
+        self.df_infer: pd.DataFrame
         # self.pvout_max = self.df_train['PVout'].max()
         # self.pvout_min = self.df_train['PVout'].min()
         # self.price_max = self.df_train['price'].max()
@@ -74,33 +77,25 @@ class BatteryEnv(gym.Env):
         ], dtype=np.float32)
         return obs, state_idx
 
-    def step(self, action, current_soc, battery_capacity, state_idx, dual_lambda):
-        _current_soc = current_soc * battery_capacity  # SoCをkWhに変換
+    def step(self, action, obs, battery_capacity, state_idx, dual_lambda):
+        _current_soc = obs[3] * battery_capacity  # SoCをkWhに変換
         next_soc = (_current_soc - action)/battery_capacity # [kWh]-[kWh]->正規化
         reward = np.asarray([self._get_reward(action, state_idx)], dtype=np.float32)
 
-        sin_time, cos_time = get_time_data(state_idx, self.day_steps)
         # φ_ζ(s,a)の計算
-        s_t = torch.tensor(
-            [self.df_train["PVout"][state_idx],
-             self.df_train["price"][state_idx],
-             self.df_train["imbalance"][state_idx],
-             current_soc,
-             sin_time,
-             cos_time],
-             dtype = torch.float32
+        s_t = torch.tensor(obs, dtype=torch.float32
             #  device = self.device
             )
-        a_t = torch.tensor(
-            action,
-            dtype=torch.float32,
+        a_t = torch.tensor(action,dtype=torch.float32,
             # device = self.device
             )
+        
         # φ_ζ(s,a)
         phi_zeta = self.zeta_net(s_t, a_t)
 
         # C(s,a)=λ^T φ_ζ
         cost = torch.dot(dual_lambda, phi_zeta).item() # スカラー値に変換
+
         done = (self.df_train.at[state_idx,"hour"] == 23.5)
         state_idx += 1 if not done else 0
         info = {"cost": cost,
@@ -116,4 +111,46 @@ class BatteryEnv(gym.Env):
             sin_time,
             cos_time
         ], dtype=np.float32)
+
         return next_obs, reward, done, info
+    
+    # 推論用reset関数
+    def inference_reset(self):
+        if self.df_infer is None:
+            raise ValueError("[BatteryEnv] 推論用データフレームが設定されていません。先に set_inference_df() を呼び出してください。")
+        initial_soc = 0.0
+        obs = np.array([
+            self.df_infer.loc[0, "PVout_norm"], # 実測値
+            self.df_infer.loc[0, "price_norm"], # 実測値
+            self.df_infer.loc[0,  "imbalance_norm"], # 実測値
+            initial_soc, # 初期SoC
+            0.0, # 時間情報
+            1.0  # 時間情報
+        ], dtype=np.float32)
+
+        return obs
+    
+    # 推論用のstep関数
+    def inference_step(self, action, obs, battery_capacity, idx):
+        _current_soc = obs[3] * battery_capacity
+        next_soc = (_current_soc - action) / battery_capacity # [kWh]-[kWh]->正規化
+        # 次のindex
+        next_idx = idx + 1
+        if next_idx >= len(self.df_infer):
+            obs[3] = next_soc
+            return obs, True
+        
+        sin_time, cos_time = get_time_data(next_idx, self.day_steps)
+        next_obs = np.array([
+            self.df_infer.loc[next_idx, "PVout_norm"], # 実測値
+            self.df_infer.loc[next_idx, "price_norm"], # 実測値
+            self.df_infer.loc[next_idx, "imbalance_norm"], # 実測値
+            next_soc, # 次のSoC
+            sin_time,
+            cos_time
+        ], dtype=np.float32)
+        return next_obs, False
+    
+    def set_inference_df(self, df:pd.DataFrame) -> None:
+        self.df_infer = df.reset_index(drop=True)
+

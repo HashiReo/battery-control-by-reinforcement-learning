@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import numpy as np
+import pandas as pd
 from collections import deque
 import gym
 import torch
@@ -9,11 +10,13 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard.writer import SummaryWriter
 import pickle
+from pathlib import Path
 from datetime import datetime, timedelta
 from tqdm import tqdm, trange
 from stable_baselines3.common.buffers import ReplayBuffer
 from MCEICRL_env import BatteryEnv
 from MCEICRL_net import GaussianPolicy, QNetwork, FeatureDecoder, FeatureEncoder
+from MCEICRL_utils import load_filtered_dataframe, step_opt_profit, step_base_profit, plot_schedule
 
 def soft_update(target: nn.Module, source: nn.Module, tau: float):
     for t, s in zip(target.parameters(), source.parameters()):
@@ -59,7 +62,8 @@ class MCEICRLTrainer:
             day_steps = config.day_steps,
             obs_dim = config.obs_dim,
             act_dim = config.act_dim,
-            feature_dim = config.feature_dim
+            feature_dim = config.feature_dim,
+            train_data_path = config.train_data_path
         )
         obs_dim = config.obs_dim
         act_dim = config.act_dim
@@ -144,7 +148,6 @@ class MCEICRLTrainer:
             
 
     def train(self):
-        # nominal policyは4つのエピソードを保存
         self.nominal_policy_trajectories = deque(maxlen = self.num_nominal_trajectories)
         global_step = 0
 
@@ -157,7 +160,7 @@ class MCEICRLTrainer:
                 with torch.no_grad(): # 勾配計算を無効化
                     action, logp = self.policy.sample(obs_tensor) # nominal policyから行動をサンプリング
                 action_np = action.cpu().numpy() # 行動をnumpy配列に変換
-                next_obs, reward, done, info = self.env.step(action_np, obs[3], self.battery_capacity, state_idx, self.dual_lambda) # 環境を1ステップ進める, reward = 環境即時報酬(収益)
+                next_obs, reward, done, info = self.env.step(action_np, obs, self.battery_capacity, state_idx, self.dual_lambda) # 環境を1ステップ進める, reward = 環境即時報酬(収益)
                 cost = info.get('cost', 0.0) # コストを取得, C(st, at) = λ^T φ_ζ(st, at)
                 state_idx = info.get('state_idx', state_idx) # ステップ数を更新
 
@@ -193,8 +196,6 @@ class MCEICRLTrainer:
                     self._update_sac(batch)
 
             self.nominal_policy_trajectories.append(rollout) # 軌道を保存
-            avg_cost = float(np.mean(ep_costs)) # 1エピソードのコスト平均を計算
-
             # --- Dual λ & ζの更新 ---
             # rolloutからpolicy_phiを計算
             # policy_obs, policy_acs = zip(*rollout) # (s, a)のリスト, 状態と行動のリストを分離
@@ -219,6 +220,7 @@ class MCEICRLTrainer:
             ## -------------------------------------------------------
 
         self.writer.close()
+        return ep_profit
 
     # SACでの更新, 論理を理解しきれていないからここは後で要確認
     def _update_sac(self, batch):
@@ -309,6 +311,81 @@ class MCEICRLTrainer:
                 sys.exit(1)
 
         return total_feature / expert_num_rollouts
+    
+    def save(self, ckpt_path: str):
+        torch.save({
+            "policy":       self.policy.state_dict(),
+            "q":            self.q.state_dict(),
+            "target_q":     self.target_q.state_dict(),
+            "zeta_net":     self.zeta_net.state_dict(),
+            "dual_lambda":  self.dual_lambda,
+        }, ckpt_path)
+
+    def load(self, ckpt_path: str):
+        ckpt = torch.load(ckpt_path, map_location=self.device)
+        self.policy.load_state_dict(ckpt["policy"])
+        self.q.load_state_dict(ckpt["q"])
+        self.target_q.load_state_dict(ckpt["target_q"])
+        self.zeta_net.load_state_dict(ckpt["zeta_net"])
+        self.dual_lambda = ckpt["dual_lambda"].to(self.device)
+
+    def run_inference_range(self, csv_path, start_date, end_date, plot_dir):
+        
+        #  データ読み込み & 対象期間のフィルタリング
+        print(f"Loading data from {csv_path} for the period {start_date} to {end_date}... \n")
+        df = load_filtered_dataframe(csv_path, start_date, end_date)
+        # 推論用のデータフレームをセット
+        trainer.env.set_inference_df(df)
+        obs = trainer.env.inference_reset()
+        results, cum_opt , cum_base = [], 0.0, 0.0
+        
+        for idx, row in enumerate(df.itertuples(index=False)): # idx=0,1,...,end_idx, row=各行のデータ
+            price = row.price
+            pv = row.PVout
+            # --- 行動決定 ---
+            obs_tensor = torch.tensor(obs, dtype=torch.float32, device=trainer.device)
+            with torch.no_grad():
+                action = trainer.policy.act(obs_tensor)
+            action_np = action.cpu().numpy()
+
+            # --- ステップ収益計算 ---
+            cum_opt += step_opt_profit(price, pv, action_np[0])
+            cum_base += step_base_profit(price, pv)
+
+            # --- 結果記録 ---
+            results.append({
+                "date":                     row.date,
+                "hour":                     row.hour,
+                "battery_soc":        obs[3] * trainer.battery_capacity,
+                "pvout":              pv,
+                "price" :         price,
+                "action":             action_np[0],
+                "cumrev_optimal":     cum_opt,
+                "cumrev_baseline" :   cum_base,
+            })
+
+            # --- 環境ステップ ---
+            obs, done = trainer.env.inference_step(action_np, obs, trainer.battery_capacity, idx)
+            if done:
+                break
+
+        # --- 結果をDataFrameに変換して保存 ---
+        df_out = pd.DataFrame(results)
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        df_out.to_csv(plot_dir / "inference_result.csv", index=False)
+
+        # --- 累積収益等を可視化 ---
+        plot_schedule(df_out, f"{start_date} ~ {end_date}", plot_dir / "schedule.png")
+
+        diff = cum_opt - cum_base
+        pct  = diff / cum_base * 100 if cum_base else float("nan")
+
+        print("================ SUMMARY ================")
+        print(f"Period             : {start_date} → {end_date}")
+        print(f"Baseline revenue   : {cum_base:.2f} Yen")
+        print(f"Optimised revenue  : {cum_opt:.2f} Yen")
+        print(f"Difference         : {diff:+.2f} Yen  ({pct:+.1f} %)")
+        print("=========================================")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -318,7 +395,7 @@ if __name__ == '__main__':
     parser.add_argument('--feature_dim', type=int, default=128, help="特徴空間の次元数")
     parser.add_argument('--battery_capacity', type=float, default=4.0, help="蓄電池の容量")
     parser.add_argument('--day_steps', type=int, default=48, help="1日のステップ数")
-    parser.add_argument('--buffer_size', type=int, default=144, help="バッファのサイズ")
+    parser.add_argument('--buffer_size', type=int, default=192, help="バッファのサイズ")
     parser.add_argument('--batch_size', type=int, default=48, help="バッチサイズ")
     parser.add_argument('--n_iters', type=int, default=2000, help="エピソード数(学習日数)")
     parser.add_argument('--policy_lr', type=float, default=3e-5)
@@ -329,12 +406,24 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--lambda_init', type=float, default=1.0)
     parser.add_argument('--dual_lambda_lr', type=float, default=1e-3, help="dual λ の学習率")
-    parser.add_argument('--alpha_k', type=float, default=0.01, help="制約閾値 αₖ（ϕ の許容差）")
+    parser.add_argument('--alpha_k', type=float, default=0.001, help="制約閾値 αₖ（ϕ の許容差）")
     parser.add_argument('--zeta_lr', type=float, default=3e-4, help="ζ ネットワークの学習率")
-    parser.add_argument('--expert_path', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/EXPERT')
     parser.add_argument('--num_nominal_trajectories', type=int, default=10, help="nominal policyのロールアウト数")
+
+    parser.add_argument('--mode', type=str, choices=['train', 'inference'], default='inference', help='実行モード')
+
+    parser.add_argument('--train_data_path', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/data_for_ICRL/train_data/only0905_PV4.csv', help="学習データのパス")
+    parser.add_argument('--expert_path', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/EXPERT')
     parser.add_argument('--expert_start_date', type=str, default='2022-09-04', help="エキスパートデータの開始日")
     parser.add_argument('--expert_end_date', type=str, default='2022-09-04', help="エキスパートデータの終了日")
+    
+    parser.add_argument('--checkpoint_path', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/checkpoints/mce_icrl_checkpoint.pth', help="学習モデルの保存先")
+    parser.add_argument('--inference_input_csv', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/data_for_ICRL/inference_data/only0905_PV4.csv', help="推論入力CSVファイルのパス")
+    parser.add_argument('--inference_output', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/data_for_ICRL/inference_data/output.csv', help="推論出力CSVファイルのパス")
+    parser.add_argument('--inference_start_date', type=str, default='2022-09-05', help="推論開始日")
+    parser.add_argument('--inference_end_date', type=str, default='2022-09-05', help="推論終了日")
+    parser.add_argument('--inference_result_dir', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/results/inference_result', help="推論結果の保存ディレクトリ")
+
     # Constraint Net 設定
     # parser.add_argument('--cn_layers', nargs='*', type=int, default=[64,64])
     # parser.add_argument('--cn_batch_size', type=int, default=64)
@@ -342,6 +431,20 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     trainer = MCEICRLTrainer(args)
+
+    if args.mode == "train":
+        final_profit = float(trainer.train())
+        trainer.save(args.checkpoint_path)
+        print(f"FINAL_EPISODE_PROFIT_YEN: {final_profit:.2f}")
+
+    elif args.mode == "inference":
+        trainer.load(args.checkpoint_path)
+        trainer.run_inference_range(
+            csv_path=args.inference_input_csv,
+            start_date=args.inference_start_date,
+            end_date=args.inference_end_date,
+            plot_dir=Path(args.inference_result_dir)
+        )
 
     # ─── オートエンコーダ事前学習 ───
     # # (1) デコーダのインスタンス化
@@ -366,6 +469,3 @@ if __name__ == '__main__':
     #                   lr=args.zeta_lr,
     #                   device=trainer.device)
     # ─────────────────────────────────
-
-    # 本来の MCE-ICRL 学習開始
-    trainer.train()

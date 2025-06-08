@@ -13,8 +13,6 @@ Battery Dynamic-Programming Optimiser  (v1.7)
 ────────────────────────────────────────────
 • 指定日の PV 出力・価格に対し、蓄電池 (4kWh, ±2kW) の充放電を DP で最適化。
 • ベースライン（即時売電）の収益との差額を表示。
-• 🔹 `--fig-dir` でグラフの保存先ディレクトリを指定可能
-      └ デフォルト: `Battery-Control-By-Reinforcement-Learning/DP_results`
 • 🔹 `--save-pkl` で RL 用 pickle を保存可能
       └ ディレクトリを渡すと `<YYYY-MM-DD>_dp.pkl` 自動命名。
 """
@@ -26,7 +24,7 @@ STEP_LEN_H = 0.5
 BATTERY_CAPACITY = 4.0
 RATE_LIMIT_KWH = 2.0
 UNIT = 0.01                     # DP discretisation (kWh)
-DEFAULT_FIG_DIR = Path("Battery-Control-By-Reinforcement-Learning/DP_results")
+DEFAULT_FIG_DIR = Path("Battery-Control-By-Reinforcement-Learning/results/DP_result")
 
 CAP_UNITS = int(round(BATTERY_CAPACITY / UNIT)) # Soc400個 
 RATE_UNITS = int(round(RATE_LIMIT_KWH / UNIT)) # 充放電200個
@@ -214,9 +212,9 @@ def main(csv_path: Path, date_str: str,
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Battery DP optimiser & PKL exporter (v1.7)")
-    parser.add_argument("--csv", type=Path, default=Path("Battery-Control-By-Reinforcement-Learning/train_data/only0904_PV2.csv"), help="学習用CSVデータのパス")
+    parser.add_argument("--csv", type=Path, default=Path("Battery-Control-By-Reinforcement-Learning/MCEICRL/data_for_ICRL/train_data/only0904_PV2.csv"), help="学習用CSVデータのパス")
     parser.add_argument("--date", type=str, default="2022-09-04", help="Target date YYYY-MM-DD")
-    parser.add_argument("--fig-dir", type=Path, default="Battery-Control-By-Reinforcement-Learning/MCEICRL/DP_PLOT", help="動的計画法で得たグラフの保存先")
+    parser.add_argument("--fig-dir", type=Path, default="Battery-Control-By-Reinforcement-Learning/MCEICRL/results/DP_result", help="動的計画法で得たグラフの保存先")
     parser.add_argument("--save-pkl", type=Path, default="Battery-Control-By-Reinforcement-Learning/MCEICRL/EXPERT", help="動的計画法で得たobsとactionのpkl保存先")
     # --------------------------------------------
     # 正規化用パラメータ

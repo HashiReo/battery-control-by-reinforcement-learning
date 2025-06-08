@@ -5,10 +5,15 @@ import pickle
 from typing import List, Tuple, Any
 import os
 import pandas as pd
+import sys
+import torch
+import matplotlib.pyplot as plt
+from datetime import datetime
 
+import matplotlib.dates as mdates
 
 # ==============================================================================
-# Gym utilities
+# MCEICRL_env.py utilities
 # ==============================================================================
 
 # normalize function(the output typr is "Series")
@@ -98,9 +103,97 @@ def operate_action(PV, action, current_soc, battery_capacity):
 
     return edited_action, next_soc, action_difference
 
-def get_train_df():
-        # 読み込む行を列名で指定：year,month,day,hour, PVout, price, imbalance  
-        # 学習用データを指定
-        df_traindata = pd.read_csv("Battery-Control-By-Reinforcement-Learning/MCEICRL/train_data_for_ICRL/only0905_PV4.csv",
-                                   usecols=["year","month","day","hour","PVout","price","imbalance"])      
-        return df_traindata
+def get_train_df(train_data_path):
+    # 読み込む行を列名で指定：year,month,day,hour, PVout, price, imbalance  
+    # 学習用データを指定
+    df_traindata = pd.read_csv(train_data_path, usecols=["year","month","day","hour","PVout","price","imbalance"])      
+    return df_traindata
+
+# ==============================================================================
+# MCEICRL_main.py utilities
+# Inference utilities
+# ==============================================================================
+
+def load_filtered_dataframe(csv_path, start_date, end_date) -> pd.DataFrame:
+    """
+    - 推論データの読み込み
+    - 指定された期間(start_date, end_date)でフィルタリング
+    - 正規化列の追加(PVout, price, imbalance)
+    """
+    # 推論データの読み込み & 指定期間でフィルタリング
+    df_all = pd.read_csv(csv_path, parse_dates = ["date"])
+    mask   = (df_all["date"] >= pd.to_datetime(start_date)) & (df_all["date"] <= pd.to_datetime(end_date))
+    df     = df_all.loc[mask].reset_index(drop=True)
+    # データが空の場合はエラー
+    if df.empty:
+        sys.stderr.write(
+            f"[Error] CSV {csv_path}において\n"
+            f"{start_date} ~ {end_date}の範囲でデータが見つかりません。\n"
+        )
+        sys.exit(1)
+
+    # 正規化のための最大値・最小値の設定（MCEICRL_env.pyのinitに合わせる）
+    pv_max, pv_min = 2.0, 0.0
+    price_max, price_min = 200.0, 0.0
+    imb_max, imb_min = 200.0, 0.0
+
+    # 正規化列の追加
+    df["PVout_norm"] = normalize(df["PVout"], pv_max, pv_min)
+    df["price_norm"] = normalize(df["price"], price_max, price_min)
+    df["imbalance_norm"] = normalize(df["imbalance"], imb_max, imb_min)
+    return df
+
+def step_opt_profit(price, pv, action):
+    deal_energy = pv + action
+    profit = deal_energy * price
+    return max(profit, 0.0)
+
+def step_base_profit(price, pv):
+    return max(pv*price, 0.0)
+
+def plot_schedule(df, title, save_path) -> None:
+    # 1) 日付＋時間を DatetimeIndex に変換
+    #    ここでは "date" が pandas.Timestamp, "hour" が数値 0〜23（または 0〜47 など）と想定
+    df["datetime"] = df.apply(
+        lambda r: pd.to_datetime(r["date"]) + pd.Timedelta(hours=int(r["hour"])),
+        axis=1
+    )
+
+    fig, ax1 = plt.subplots(figsize=(11, 6))
+    # 2) X 軸に datetime を指定
+    ax1.step(df["datetime"], df["battery_soc"], where="mid",
+             label="battery_soc", color="navy")
+    ax1.bar(df["datetime"], df["pvout"],
+            width=0.02,  # 30分幅で表示
+            label="PV gen", color="purple", alpha=0.4)
+    ax1.set_xlabel("Datetime")
+    ax1.set_ylabel("Battery SOC / PV gen")
+
+    ax2 = ax1.twinx()
+    ax2.plot(df["datetime"], df["price"], label="price", color="orange")
+    ax2.set_ylabel("price (yen/kWh)")
+
+    ax3 = ax1.twinx()
+    ax3.spines.right.set_position(("outward", 60))
+    ax3.plot(df["datetime"], df["cumrev_optimal"],  label="CumRev Opt", color="green")
+    ax3.plot(df["datetime"], df["cumrev_baseline"], label="CumRev Base",
+             linestyle="--", color="red", alpha=0.7)
+    ax3.set_ylabel("Cum Revenue (yen)")
+
+    # 3) 日時のフォーマットを横軸に設定
+    ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax1.xaxis.set_major_formatter(mdates.ConciseDateFormatter(mdates.AutoDateLocator()))
+
+    lines, labels = [], []
+    for ax in (ax1, ax2, ax3):
+        h, l = ax.get_legend_handles_labels()
+        lines += h; labels += l
+    ax1.legend(lines, labels, loc="upper left", frameon=False)
+
+    plt.title(title)
+    plt.grid(True)
+    plt.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"[FIG] Saved → {save_path}")
