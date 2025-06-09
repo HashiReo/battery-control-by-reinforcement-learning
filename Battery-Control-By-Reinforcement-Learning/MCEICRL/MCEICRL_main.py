@@ -220,7 +220,7 @@ class MCEICRLTrainer:
             ## -------------------------------------------------------
 
         self.writer.close()
-        return ep_profit
+        return
 
     # SACでの更新, 論理を理解しきれていないからここは後で要確認
     def _update_sac(self, batch):
@@ -330,7 +330,6 @@ class MCEICRLTrainer:
         self.dual_lambda = ckpt["dual_lambda"].to(self.device)
 
     def run_inference_range(self, csv_path, start_date, end_date, plot_dir):
-        
         #  データ読み込み & 対象期間のフィルタリング
         print(f"Loading data from {csv_path} for the period {start_date} to {end_date}... \n")
         df = load_filtered_dataframe(csv_path, start_date, end_date)
@@ -389,15 +388,20 @@ class MCEICRLTrainer:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    # -- 主要設定 --
-    parser.add_argument('--obs_dim', type=int, default=6, help="観測空間の次元数")
-    parser.add_argument('--act_dim', type=int, default=1, help="行動空間の次元数")
-    parser.add_argument('--feature_dim', type=int, default=128, help="特徴空間の次元数")
+    # =======================================================
+    # Training settings
+    # =======================================================
+    parser.add_argument('--n_iters', type=int, default=2500, help="エピソード数(学習日数)")
     parser.add_argument('--battery_capacity', type=float, default=4.0, help="蓄電池の容量")
     parser.add_argument('--day_steps', type=int, default=48, help="1日のステップ数")
-    parser.add_argument('--buffer_size', type=int, default=192, help="バッファのサイズ")
+    parser.add_argument('--obs_dim', type=int, default=6, help="観測空間の次元数")
+    parser.add_argument('--act_dim', type=int, default=1, help="行動空間の次元数")
+    parser.add_argument('--num_nominal_trajectories', type=int, default=10, help="nominal policyのロールアウト数")
     parser.add_argument('--batch_size', type=int, default=48, help="バッチサイズ")
-    parser.add_argument('--n_iters', type=int, default=2000, help="エピソード数(学習日数)")
+    parser.add_argument('--buffer_size', type=int, default=192, help="バッファのサイズ")
+    # =======================================================
+    # Hyperparameters
+    # =======================================================
     parser.add_argument('--policy_lr', type=float, default=3e-5)
     parser.add_argument('--qf_lr', type=float, default=3e-4)
     parser.add_argument('--ent_coef', type=float, default=0.0001, help="エントロピー重み")
@@ -406,25 +410,33 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--lambda_init', type=float, default=1.0)
     parser.add_argument('--dual_lambda_lr', type=float, default=1e-3, help="dual λ の学習率")
+    parser.add_argument('--feature_dim', type=int, default=128, help="特徴空間の次元数")
     parser.add_argument('--alpha_k', type=float, default=0.001, help="制約閾値 αₖ（ϕ の許容差）")
     parser.add_argument('--zeta_lr', type=float, default=3e-4, help="ζ ネットワークの学習率")
-    parser.add_argument('--num_nominal_trajectories', type=int, default=10, help="nominal policyのロールアウト数")
-
-    parser.add_argument('--mode', type=str, choices=['train', 'inference'], default='inference', help='実行モード')
-
+    # =======================================================
+    # Training data settings
+    # =======================================================
     parser.add_argument('--train_data_path', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/data_for_ICRL/train_data/only0905_PV4.csv', help="学習データのパス")
     parser.add_argument('--expert_path', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/EXPERT')
     parser.add_argument('--expert_start_date', type=str, default='2022-09-04', help="エキスパートデータの開始日")
     parser.add_argument('--expert_end_date', type=str, default='2022-09-04', help="エキスパートデータの終了日")
-    
     parser.add_argument('--checkpoint_path', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/checkpoints/mce_icrl_checkpoint.pth', help="学習モデルの保存先")
+    # =======================================================
+    # Inferencce settings
+    # =======================================================
     parser.add_argument('--inference_input_csv', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/data_for_ICRL/inference_data/only0905_PV4.csv', help="推論入力CSVファイルのパス")
     parser.add_argument('--inference_output', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/data_for_ICRL/inference_data/output.csv', help="推論出力CSVファイルのパス")
     parser.add_argument('--inference_start_date', type=str, default='2022-09-05', help="推論開始日")
     parser.add_argument('--inference_end_date', type=str, default='2022-09-05', help="推論終了日")
     parser.add_argument('--inference_result_dir', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/results/inference_result', help="推論結果の保存ディレクトリ")
+    # =======================================================
+    # Mode setting
+    # =======================================================
+    parser.add_argument('--mode', type=str, choices=['train', 'inference'], default='train', help='実行モード')
 
-    # Constraint Net 設定
+    # =======================================================
+    # ConstraintNet settings
+    # =======================================================
     # parser.add_argument('--cn_layers', nargs='*', type=int, default=[64,64])
     # parser.add_argument('--cn_batch_size', type=int, default=64)
     # parser.add_argument('--cn_learning_rate', type=float, default=3e-4)
@@ -433,9 +445,8 @@ if __name__ == '__main__':
     trainer = MCEICRLTrainer(args)
 
     if args.mode == "train":
-        final_profit = float(trainer.train())
+        trainer.train()
         trainer.save(args.checkpoint_path)
-        print(f"FINAL_EPISODE_PROFIT_YEN: {final_profit:.2f}")
 
     elif args.mode == "inference":
         trainer.load(args.checkpoint_path)
