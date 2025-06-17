@@ -272,7 +272,7 @@ class MCEICRLTrainer:
         # Q関数の更新
         soft_update(self.target_q, self.q, self.tau)
 
-    def _compute_feature_expectation_from_nominal_trajectories(self, gamma = 0.99):
+    def _compute_feature_expectation_from_nominal_trajectories(self, gamma = 1.0):
         """
         Trajectoriesから軌道特徴量期待値(E_π[φ_ζ(τ)])を計算
         input: trajectories: list of trajectories
@@ -284,17 +284,17 @@ class MCEICRLTrainer:
             return torch.zeros(self.feature_dim, device = self.device)
         
         total_feature = torch.zeros(self.feature_dim, device = self.device)
-        for traj in self.nominal_policy_trajectories:# 軌道数 i=1,2,...,N
-            discounted_sum = torch.zeros(self.feature_dim, device = self.device)
-            for t, (s, a) in enumerate(traj): # 軌道の長さ t=0,1,...,T-1
-                s_t = torch.tensor(s, dtype = torch.float32, device = self.device)
-                a_t = torch.tensor(a, dtype = torch.float32, device = self.device)
-                phi_zeta = self.zeta_net(s_t, a_t)
-                discounted_sum += (gamma ** t) * phi_zeta
-            total_feature += discounted_sum
+        for traj in self.nominal_policy_trajectories:          # ← deque に保持している複数日分
+            s_batch = torch.as_tensor([s for (s, _) in traj], device=self.device)
+            a_batch = torch.as_tensor([a for (_, a) in traj], device=self.device)
+            T = s_batch.shape[0]                       # 48
+            weights = (gamma ** torch.arange(T, device=self.device)).unsqueeze(1)
+            with torch.no_grad():
+                phi_zeta = self.zeta_net(s_batch, a_batch)
+                total_feature += (weights * phi_zeta).sum(dim=0)
         return total_feature / num_trajectories
        
-    def _compute_feature_expectation_from_expert_trajectories(self, gamma = 0.99):
+    def _compute_feature_expectation_from_expert_trajectories(self, gamma = 1.0):
         """
         Trajectoriesから軌道特徴量期待値(E_π[φ_ζ(τ)])を計算
         input: trajectories: list of trajectories
@@ -312,11 +312,13 @@ class MCEICRLTrainer:
 
                 s_batch = torch.as_tensor(data["observations"], device=self.device)
                 a_batch = torch.as_tensor(data["actions"], device=self.device)
+                T = s_batch.shape[0]
+                weights = (gamma ** torch.arange(T, device=self.device)).unsqueeze(1)
                 with torch.no_grad():
                     phi = self.zeta_net(s_batch, a_batch)
-                    summed_phi = phi.sum(dim=0)
+                    discounted = (weights * phi).sum(dim=0)
 
-                total_feature += summed_phi
+                total_feature += discounted
                 expert_rollouts += 1
             current += timedelta(days=1)
 

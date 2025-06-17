@@ -263,9 +263,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Battery DP optimiser & PKL exporter (v1.7)")
     parser.add_argument("--csv", type=Path, default=str(TRAINDATA_DIR / "input_data2022_edited_imbalance0.csv"), 
                         help="学習用CSVデータのパス")
-    parser.add_argument("--start-date", type=str, default="2022-09-01",
+    parser.add_argument("--start-date", type=str, default="2023-01-01",
                         help="開始日付 YYYY-MM-DD")
-    parser.add_argument("--end-date", type=str, default="2022-09-30",
+    parser.add_argument("--end-date", type=str, default="2023-01-31",
                         help="終了日付 YYYY-MM-DD (省略時は開始日のみ)")
     parser.add_argument("--fig-dir", type=Path, default=FIG_DIR, 
                         help="動的計画法で得たグラフの保存先")
