@@ -65,8 +65,6 @@ class BatteryEnv(gym.Env):
         return step_profit
 
     def _get_reward(self, action, state_idx):
-        tau = 0.05 * self.G_max # 最適収益の残り5%からギアを挙げる
-        K = 10.0 # ブースト倍率
         step_profit = self.step_profit(action, state_idx)
         self.RL_cum += step_profit
         G_t = self.df_raw.at[state_idx, "CumRev_Optimal"]
@@ -74,9 +72,7 @@ class BatteryEnv(gym.Env):
         reward = (self.prev_gap - gap_t) / self.G_max
         # reward = (self.prev_gap - gap_t / (self.prev_gap + 1e-6))
         self.prev_gap = gap_t
-        if reward < tau:
-            reward *= K
-            
+
         return reward, self.RL_cum
 
     # reset, stepは仮で実装
