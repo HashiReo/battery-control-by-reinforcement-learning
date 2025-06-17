@@ -7,6 +7,7 @@ from typing import Tuple, Optional
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import pathlib
 
 """
 Battery Dynamic-Programming Optimiser  (v1.7)
@@ -17,14 +18,20 @@ Battery Dynamic-Programming Optimiser  (v1.7)
       └ ディレクトリを渡すと `<YYYY-MM-DD>_dp.pkl` 自動命名。
 """
 
+
 # ----------------------------------------------------------------------------
 # CONSTANTS (defaults)
 # ----------------------------------------------------------------------------
 STEP_LEN_H = 0.5
 BATTERY_CAPACITY = 4.0
 RATE_LIMIT_KWH = 2.0
-UNIT = 0.01                     # DP discretisation (kWh)
-DEFAULT_FIG_DIR = Path("Battery-Control-By-Reinforcement-Learning/results/DP_result")
+UNIT = 0.001               # DP discretisation (kWh)
+
+# ディレクトリ設定
+MCEICRL_DIR = pathlib.Path(__file__).resolve().parent # .../MCEICRL
+TRAINDATA_DIR = Path(str(MCEICRL_DIR / "data_for_ICRL" / "train_data")) # .../MCEICRL/data_for_ICRL/train_data
+FIG_DIR = Path(str(MCEICRL_DIR / "results" / "DP_result")) # .../MCEICRL/results/DP_result
+EXPERT_DIR = Path(str(MCEICRL_DIR / "EXPERT")) # .../MCEICRL/EXPERT
 
 CAP_UNITS = int(round(BATTERY_CAPACITY / UNIT)) # Soc400個 
 RATE_UNITS = int(round(RATE_LIMIT_KWH / UNIT)) # 充放電200個
@@ -59,7 +66,8 @@ def optimise_schedule(pv_kwh: np.ndarray, price: np.ndarray) -> Tuple[pd.DataFra
     for t in range(n):
         _, a = best(t, soc)
         soc -= a
-        sold_kwh = pv_kwh[t] + (a * UNIT)
+        # sold_kwh = pv_kwh[t] + (a * UNIT)
+        sold_kwh = (pv_units[t] + a) * UNIT
         rev_opt += sold_kwh * price[t]
         rev_base += pv_kwh[t] * price[t]
         rows.append({
@@ -118,104 +126,152 @@ def build_dataset_pkl(day_df: pd.DataFrame, sched: pd.DataFrame,
                        imb_max, imb_min, save_path: Path) -> None:
     day_steps = 48
     norm = lambda x, mx, mn: (x - mn) / (mx - mn) if mx != mn else x
-    soc_before = np.insert(sched["Battery SOC (kWh)"].values[:-1], 0, 0.0) / BATTERY_CAPACITY
+    pv_norm   = norm(day_df["PVout"   ].to_numpy(float), pv_max,   pv_min)
+    price_norm   = norm(day_df["price"   ].to_numpy(float), price_max, price_min)
+    imb_norm  = norm(day_df["imbalance"].to_numpy(float), imb_max,  imb_min)
+    soc_before = np.concatenate(([0.0], sched["Battery SOC (kWh)"].to_numpy(dtype=float)[:-1])) / BATTERY_CAPACITY
+    daily_rev_dp = sched["CumRev_Optimal"].to_numpy(float)
+    rev_day_max = daily_rev_dp[-1] if daily_rev_dp[-1]!= 0 else 1.0
+    rev_dp_norm = daily_rev_dp / rev_day_max
+
     idx = (sched["hour"].to_numpy(float) / STEP_LEN_H).astype(int)
     theta = 2 * np.pi * idx / day_steps
     sin_t, cos_t = np.sin(theta), np.cos(theta)
+
+    # build observations and actions
     obs = np.column_stack([
-        norm(day_df["PVout"].to_numpy(float), pv_max, pv_min),
-        norm(day_df["price"].to_numpy(float), price_max, price_min),
-        norm(day_df["imbalance"].to_numpy(float), imb_max, imb_min),
-        soc_before, sin_t, cos_t
+        pv_norm,
+        price_norm,
+        imb_norm,
+        soc_before,
+        rev_dp_norm,
+        sin_t,
+        cos_t,
     ]).astype(np.float32)
-    action_kw = (sched["Charge/Discharge (kWh)"].to_numpy(float))
-    act = action_kw.reshape(-1, 1).astype(np.float32)
+    action_kw = sched["Charge/Discharge (kWh)"].to_numpy(float).reshape(-1, 1).astype(np.float32)
+
+    # extract cumulative revenues
+    cum_opt = sched["CumRev_Optimal"].to_numpy(float).reshape(-1, 1)
+    cum_base = sched["CumRev_Baseline"].to_numpy(float).reshape(-1, 1)
+
+    # save pickle
     save_path.parent.mkdir(parents=True, exist_ok=True)
     with open(save_path, "wb") as f:
-        pickle.dump({"observations": obs, "actions": act}, f)
+        pickle.dump({"observations": obs, "actions": action_kw}, f)
     print(f"[PKL] Saved → {save_path}")
 
-    csv_path = save_path.with_suffix(".csv")      # 同じ名前で拡張子だけ .csv
-    col_names = [                                  # obs 列名
+    # save CSV with cumulative revenue columns
+    csv_path = save_path.with_suffix(".csv")
+    col_names = [
         "PVout_norm", "price_norm", "imb_norm",
-        "SOC_before", "sin_t", "cos_t", "action_kW"
+        "SOC_before", "CumRev_DP_norm",
+        "sin_t", "cos_t",
+        "action_kW",
+        "CumRev_Optimal", "CumRev_Baseline"
     ]
-    df_csv = pd.DataFrame(np.hstack([obs, act]), columns=col_names)
+    data_matrix = np.hstack([obs, action_kw, cum_opt, cum_base])
+    df_csv = pd.DataFrame(data_matrix, columns=col_names)
     df_csv.to_csv(csv_path, index=False)
     print(f"[CSV] Saved → {csv_path}")
-
-# ----------------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------------
-
-def resolve_dir_path(date_str: str, arg_path: Optional[Path], default_dir: Path, suffix: str) -> Path:
-    """Return directory path (create if needed) and auto‑name file inside if directory given."""
-    if arg_path is None:
-        dir_path = default_dir
-        dir_path.mkdir(parents=True, exist_ok=True)
-        return dir_path / f"{date_str}{suffix}"
-    if arg_path.suffix == "" or arg_path.is_dir():
-        dir_path = arg_path if arg_path.suffix == "" else arg_path
-        dir_path.mkdir(parents=True, exist_ok=True)
-        return dir_path / f"{date_str}{suffix}"
-    arg_path.parent.mkdir(parents=True, exist_ok=True)
-    return arg_path
 
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 
-def main(csv_path: Path, date_str: str,
+def main(csv_path: Path, start_date_str: str, end_date_str: Optional[str],
          fig_dir_arg: Optional[Path], pkl_path_arg: Optional[Path],
          pv_max_arg: Optional[float], pv_min_arg: Optional[float],
          price_max_arg: Optional[float], price_min_arg: Optional[float],
          imb_max_arg: Optional[float], imb_min_arg: Optional[float]) -> None:
     
     df_all = pd.read_csv(csv_path)
-    date_pd = pd.to_datetime(date_str)
-    day_df = df_all[(df_all["month"] == date_pd.month) & (df_all["day"] == date_pd.day)].copy()
-    if day_df.empty:
-        raise ValueError(f"No data for {date_str}")
+    df_all["CumRev_Optimal"] = np.nan
+    df_all["CumRev_Baseline"] = np.nan
 
-    sched, rev_opt, rev_base = optimise_schedule((day_df["PVout"]).to_numpy(dtype=float), day_df["price"].to_numpy(dtype=float))
-    diff = rev_opt - rev_base
-    pct = diff / rev_base * 100 if rev_base else float("nan")
+    # Date range setup
+    start_date = pd.to_datetime(start_date_str)
+    end_date = pd.to_datetime(end_date_str) if end_date_str else start_date
+    dates = pd.date_range(start=start_date, end=end_date, freq='D')
 
-    pv_max    = pv_max_arg    if pv_max_arg    is not None else df_all["PVout"].max()
-    pv_min    = pv_min_arg    if pv_min_arg    is not None else df_all["PVout"].min()
-    price_max = price_max_arg if price_max_arg is not None else df_all["price"].max()
-    price_min = price_min_arg if price_min_arg is not None else df_all["price"].min()
-    imb_max = imb_max_arg if imb_max_arg is not None else df_all["imbalance"].max()
-    imb_min = imb_min_arg if imb_min_arg is not None else df_all["imbalance"].min()
+    # Prepare output CSV name
+    end_label = end_date_str if end_date_str else start_date_str
+    out_fname = f"train_data_{start_date_str}~{end_label}{csv_path.suffix}"
+    out_csv_path = csv_path.parent / out_fname
 
-    print("================ SUMMARY ================")
-    print(f"Date: {date_str}")
-    print(f"Baseline revenue : {rev_base:.2f} yen")
-    print(f"Optimised revenue: {rev_opt:.2f} yen")
-    print(f"Difference       : {diff:+.2f} yen  ({pct:+.1f} %)")
-    print("=========================================")
+    date_range_tag = f"{start_date_str}~{end_label}"
+    expert_range_dir = EXPERT_DIR / date_range_tag
+    expert_range_dir.mkdir(parents=True, exist_ok=True)
 
-    # ----- figure output -----
-    fig_path = resolve_dir_path(date_str, fig_dir_arg, DEFAULT_FIG_DIR, "_plot.png")
-    plot_schedule(sched, f"Battery Optimisation vs Baseline – {date_str}", fig_path)
+    fig_range_dir = FIG_DIR / date_range_tag
+    fig_range_dir.mkdir(parents=True, exist_ok=True)
 
-    # ----- pkl output (optional) -----
-    if pkl_path_arg is not None:
-        pkl_path = resolve_dir_path(date_str, pkl_path_arg, Path("."), "_dp.pkl")
-        build_dataset_pkl(day_df.reset_index(drop=True), sched,
-                  pv_max, pv_min, price_max, price_min,
-                  imb_max, imb_min,      
-                  pkl_path)
+    for date in dates:
+        date_str = date.strftime('%Y-%m-%d')
+        mask = (df_all["year"] == date.year) & (df_all["month"] == date.month) &(df_all["day"] == date.day)
+        day_df = df_all[mask].copy().reset_index(drop=True)
+        if day_df.empty:
+            print(f"No data for {date_str}...")
+            raise ValueError(f"No data for {date_str}")
+    
+        sched, rev_opt, rev_base = optimise_schedule(
+            day_df["PVout"].to_numpy(dtype=float), 
+            day_df["price"].to_numpy(dtype=float)
+        )
+
+        diff = rev_opt - rev_base
+        pct = diff / rev_base * 100 if rev_base else float("nan")
+        print("================ SUMMARY ================")
+        print(f"Date: {date_str}")
+        print(f"Baseline revenue : {rev_base:.2f} yen")
+        print(f"Optimised revenue: {rev_opt:.2f} yen")
+        print(f"Difference       : {diff:+.2f} yen  ({pct:+.1f} %)")
+        print("=========================================")
+
+        # Full DataFrame updates
+        df_all.loc[mask, 'CumRev_Optimal'] = sched["CumRev_Optimal"].values
+        df_all.loc[mask, 'CumRev_Baseline'] = sched["CumRev_Baseline"].values
+        # ----- figure output -----
+        fig_path = fig_range_dir / f"{date_str}.png"
+        plot_schedule(sched, f"Battery Optimisation - {date_str}", fig_path)
+
+        # ----- pkl output (optional) -----
+        if pkl_path_arg is not None:
+            pkl_path = expert_range_dir / f"{date_str}_dp.pkl"
+            build_dataset_pkl(
+                day_df, sched,
+                pv_max_arg    if pv_max_arg    is not None else df_all["PVout"].max(),
+                pv_min_arg    if pv_min_arg    is not None else df_all["PVout"].min(),
+                price_max_arg if price_max_arg is not None else df_all["price"].max(),
+                price_min_arg if price_min_arg is not None else df_all["price"].min(),
+                imb_max_arg   if imb_max_arg is not None else df_all["imbalance"].max(),
+                imb_min_arg   if imb_min_arg is not None else df_all["imbalance"].min(),
+                pkl_path
+            )
+    
+    # Save updated input CSV
+    mask_all = pd.Series(False, index=df_all.index)
+    for date in dates:
+        mask_all |= (df_all["month"] == date.month) & (df_all["day"] == date.day)
+    df_out = df_all.loc[mask_all]
+    df_out.to_csv(out_csv_path, index=False)
+    print(f"[CSV] Updated -> {out_csv_path}")
 
 # ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Battery DP optimiser & PKL exporter (v1.7)")
-    parser.add_argument("--csv", type=Path, default=Path("Battery-Control-By-Reinforcement-Learning/MCEICRL/data_for_ICRL/train_data/only0904_PV2.csv"), help="学習用CSVデータのパス")
-    parser.add_argument("--date", type=str, default="2022-09-04", help="Target date YYYY-MM-DD")
-    parser.add_argument("--fig-dir", type=Path, default="Battery-Control-By-Reinforcement-Learning/MCEICRL/results/DP_result", help="動的計画法で得たグラフの保存先")
-    parser.add_argument("--save-pkl", type=Path, default="Battery-Control-By-Reinforcement-Learning/MCEICRL/EXPERT", help="動的計画法で得たobsとactionのpkl保存先")
+    parser.add_argument("--csv", type=Path, default=str(TRAINDATA_DIR / "input_data2022_edited_imbalance0.csv"), 
+                        help="学習用CSVデータのパス")
+    parser.add_argument("--start-date", type=str, default="2022-09-01",
+                        help="開始日付 YYYY-MM-DD")
+    parser.add_argument("--end-date", type=str, default="2022-09-30",
+                        help="終了日付 YYYY-MM-DD (省略時は開始日のみ)")
+    parser.add_argument("--fig-dir", type=Path, default=FIG_DIR, 
+                        help="動的計画法で得たグラフの保存先")
+    parser.add_argument("--save-pkl", type=Path, default=EXPERT_DIR,
+                        help="動的計画法で得たobsとactionのpkl保存先")
+    
     # --------------------------------------------
     # 正規化用パラメータ
     # --------------------------------------------
@@ -227,6 +283,8 @@ if __name__ == "__main__":
     parser.add_argument("--imbalance-min", type=float, default=0.0)
     args = parser.parse_args()
 
-    main(args.csv, args.date, args.fig_dir, args.save_pkl,
-        args.pv_max, args.pv_min, args.price_max, args.price_min,
-        args.imbalance_max, args.imbalance_min)
+    main(args.csv, args.start_date, args.end_date,
+         args.fig_dir, args.save_pkl,
+         args.pv_max, args.pv_min,
+         args.price_max, args.price_min,
+         args.imbalance_max, args.imbalance_min)

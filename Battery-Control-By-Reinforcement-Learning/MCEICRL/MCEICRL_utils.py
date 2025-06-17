@@ -6,11 +6,13 @@ from typing import List, Tuple, Any
 import os
 import pandas as pd
 import sys
+from sklearn import base
 import torch
 import matplotlib.pyplot as plt
 from datetime import datetime
 
 import matplotlib.dates as mdates
+from pathlib import Path
 
 # ==============================================================================
 # MCEICRL_env.py utilities
@@ -161,13 +163,10 @@ def plot_schedule(df, title, save_path) -> None:
 
     fig, ax1 = plt.subplots(figsize=(11, 6))
     # 2) X 軸に datetime を指定
-    ax1.step(df["datetime"], df["battery_soc"], where="mid",
-             label="battery_soc", color="navy")
-    ax1.bar(df["datetime"], df["pvout"],
-            width=0.02,  # 30分幅で表示
-            label="PV gen", color="purple", alpha=0.4)
+    ax1.step(df["datetime"], df["battery_soc"], where="mid", label="battery_soc", color="navy")
+    ax1.bar(df["datetime"], df["pvout"], width=0.02, label="PV out", color="purple", alpha=0.4)
     ax1.set_xlabel("Datetime")
-    ax1.set_ylabel("Battery SOC / PV gen")
+    ax1.set_ylabel("Battery SOC / PV out")
 
     ax2 = ax1.twinx()
     ax2.plot(df["datetime"], df["price"], label="price", color="orange")
@@ -175,7 +174,7 @@ def plot_schedule(df, title, save_path) -> None:
 
     ax3 = ax1.twinx()
     ax3.spines.right.set_position(("outward", 60))
-    ax3.plot(df["datetime"], df["cumrev_optimal"],  label="CumRev Opt", color="green")
+    ax3.plot(df["datetime"], df["cumrev_agent"],  label="CumRev Agent", color="green")
     ax3.plot(df["datetime"], df["cumrev_baseline"], label="CumRev Base",
              linestyle="--", color="red", alpha=0.7)
     ax3.set_ylabel("Cum Revenue (yen)")
@@ -197,3 +196,74 @@ def plot_schedule(df, title, save_path) -> None:
     plt.savefig(save_path, dpi=300)
     plt.close()
     print(f"[FIG] Saved → {save_path}")
+
+def plot_daily_revenue_comparison(df_out: pd.DataFrame, save_path: Path):
+    """
+    df_out: DataFrame with columns ['date', 'cumrev_agent', 'cumrev_dp', 'cumrev_baseline']
+    日ごとに RL agent, DP optimum, Baseline の日次累積収益を1つの棒グラフで比較して保存します。
+    """
+    # 各日付の最終値を取得
+    daily = df_out.groupby("date").agg({
+        "cumrev_agent":    "last",
+        "cumrev_dp":       "last",
+        "cumrev_baseline": "last"
+    }).reset_index()
+
+    # 日付文字列を「MM-DD」の形式で取得
+    labels = daily["date"].apply(lambda d: pd.to_datetime(d).strftime("%m-%d"))
+
+    # プロット用リスト
+    rl_vals   = daily["cumrev_agent"].values
+    dp_vals   = daily["cumrev_dp"].values
+    base_vals = daily["cumrev_baseline"].values
+
+    x = range(len(labels))
+    width = 0.25
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar([i - width for i in x], rl_vals, width, label="RL Agent")
+    ax.bar(x, dp_vals, width, label="DP Optimum")
+    ax.bar([i + width for i in x], base_vals, width, label="Baseline")
+
+    ax.set_xlabel("Date (MM-DD)")
+    ax.set_ylabel("Daily Cumulative Revenue (Yen)")
+    ax.set_title("Daily Revenue Comparison: RL vs DP vs Baseline")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.legend(loc="upper left")
+    plt.tight_layout()
+
+    os.makedirs(save_path.parent, exist_ok=True)
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"[FIG] Saved → {save_path}")
+
+def print_daily_comparison(df_out: pd.DataFrame):
+    """
+    df_out: run_inference_range で生成された DataFrame。
+    各日付の最終 cumrev_agent と cumrev_dp を比較して出力。
+    """
+    daily = df_out.groupby("date").agg({
+        "cumrev_agent": "last",
+        "cumrev_dp":    "last",
+        "cumrev_baseline": "last"
+    }).reset_index()
+
+    print("=== Daily RL vs DP vs Baseline Comparison ===")
+    for _, row in daily.iterrows():
+        date    = row["date"]
+        rl_rev  = row["cumrev_agent"]
+        dp_rev  = row["cumrev_dp"]
+        base_rev = row["cumrev_baseline"]
+        diff_dp    = rl_rev - dp_rev
+        pct_dp = diff_dp / dp_rev * 100 if dp_rev else float("nan")
+        diff_base =rl_rev - base_rev
+        pct_base = diff_base / base_rev * 100 if base_rev else float("nan")
+
+        print(f"{date}:")
+        print(f"  RL agent daily revenue      : {rl_rev:.2f} Yen")
+        print(f"  DP optimum daily revenue    : {dp_rev:.2f} Yen")
+        print(f"  Baseline daily revenue      : {base_rev:.2f} Yen")
+        print(f"  Gap (RL-DP)                 : {diff_dp:+.2f} Yen ({pct_dp:+.1f}%)")
+        print(f"  Gap (RL-Baseline)           : {diff_base:+.2f} Yen ({pct_base:+.1f}%)")
+        print("----------------------------------")

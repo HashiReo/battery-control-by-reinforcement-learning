@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+from tracemalloc import start
 import numpy as np
 import pandas as pd
 from collections import deque
@@ -16,7 +17,13 @@ from tqdm import tqdm, trange
 from stable_baselines3.common.buffers import ReplayBuffer
 from MCEICRL_env import BatteryEnv
 from MCEICRL_net import GaussianPolicy, QNetwork, FeatureDecoder, FeatureEncoder
-from MCEICRL_utils import load_filtered_dataframe, step_opt_profit, step_base_profit, plot_schedule
+from MCEICRL_utils import load_filtered_dataframe, step_opt_profit, step_base_profit, plot_schedule, print_daily_comparison, plot_daily_revenue_comparison
+import pathlib
+
+ICRL_DIR = pathlib.Path(__file__).resolve().parent # .../MCEICRL
+DATA_DIR = ICRL_DIR / "data_for_ICRL" # .../MCEICRL/data_for_ICRL
+TRAINDATA_DIR = ICRL_DIR / "data_for_ICRL" / "train_data" # .../MCEICRL/data_for_ICRL/train_data
+
 
 def soft_update(target: nn.Module, source: nn.Module, tau: float):
     for t, s in zip(target.parameters(), source.parameters()):
@@ -99,6 +106,7 @@ class MCEICRLTrainer:
         self.alpha = config.ent_coef # エントロピー重み
         self.tau = config.tau # ターゲット更新率
         self.batch_size = config.batch_size
+        self.learning_starts = config.learning_starts
         self.n_steps = config.day_steps # 1日のステップ数
         self.n_iters = config.n_iters
 
@@ -108,6 +116,17 @@ class MCEICRLTrainer:
         self.expert_start = datetime.strptime(config.expert_start_date, "%Y-%m-%d")
         self.expert_end   = datetime.strptime(config.expert_end_date,   "%Y-%m-%d")
 
+        self.expert_path = Path(config.expert_path)
+        self.expert_start = datetime.strptime(config.expert_start_date, "%Y-%m-%d")
+        self.expert_end   = datetime.strptime(config.expert_end_date,   "%Y-%m-%d")
+        self.date_range_tag = f"{config.expert_start_date}~{config.expert_end_date}"
+        self.expert_subdir = self.expert_path / self.date_range_tag
+        # エキスパートのデータが存在しない場合はエラー
+        if not self.expert_subdir.exists():
+            raise FileNotFoundError(
+                f"エキスパートのデータが見つかりません: {self.expert_subdir}"
+            )
+        
         # π(a|s)ネットワーク
         self.policy = GaussianPolicy(obs_dim, act_dim, self.battery_capacity).to(self.device)
         self.policy_opt = optim.Adam(self.policy.parameters(), lr=config.policy_lr) # parameters()に含まれるテンソル群がθ(重み＆バイアス)にあたる
@@ -129,7 +148,7 @@ class MCEICRLTrainer:
             action_space=self.env.action_space, # 環境と同じ行動空間
             device=self.device, # デバイス
         )
-        self.writer = SummaryWriter("Battery-Control-By-Reinforcement-Learning/MCEICRL/logs") 
+        self.writer = SummaryWriter(str(ICRL_DIR / "logs")) 
 
     # ラグランジュ乗数(λ)の更新
     def update_lambda(self, expert_phi, policy_phi):
@@ -152,7 +171,7 @@ class MCEICRLTrainer:
         global_step = 0
 
         for itr in trange(self.n_iters, desc="Training Episodes"): 
-            ep_costs, rollout, ep_reward, ep_profit, ep_action_sum = 0, [], 0, 0, 0
+            ep_costs, rollout, ep_shaped_r, ep_reward_scale, ep_reward = 0, [], 0, 0, 0
             obs, state_idx = self.env.reset() # 環境をリセット
             # --- Rollout/ データ収集フェーズ ---
             for step in range(self.n_steps): # ステップ数/Epiでループ
@@ -164,7 +183,7 @@ class MCEICRLTrainer:
                 cost = info.get('cost', 0.0) # コストを取得, C(st, at) = λ^T φ_ζ(st, at)
                 state_idx = info.get('state_idx', state_idx) # ステップ数を更新
 
-                shaped_r = reward - cost # reward = 環境即時報酬, cost = λ^T φ_ζ(st, at)
+                shaped_r = 100*reward - cost # reward = 環境即時報酬, cost = λ^T φ_ζ(st, at)
                 infos=[{}] # bufferのエラー対応でいったん仮設定
                 self.buffer.add(
                     obs,
@@ -182,16 +201,16 @@ class MCEICRLTrainer:
                 self.writer.add_scalar("action", action_np[0], global_step) # TensorBoardに行動を記録
                 self.writer.add_scalar("reward", reward, global_step) # TensorBoardに報酬を記録
                 self.writer.add_scalar("cost", cost, global_step) # TensorBoardにコストを記録
-                ep_reward += float(shaped_r)
-                ep_profit += reward
+                ep_shaped_r += float(shaped_r)
+                ep_reward_scale += 100*float(reward)
+                ep_reward += float(reward)
                 ep_costs += cost
-                ep_action_sum += action_np[0]
                 global_step += 1
                 # -----------------------------------
 
                 obs = next_obs
                 # バッファがたまったらバッチを取得しSAC更新を行う
-                if self.buffer.size() >= self.batch_size:
+                if self.buffer.size() >= self.learning_starts:
                     batch = self.buffer.sample(self.batch_size)
                     self._update_sac(batch)
 
@@ -212,10 +231,12 @@ class MCEICRLTrainer:
             self.zeta_opt.step() # ζを更新
             ## -------------------------------------------------------
             # Tensorboardに記録
+            ep_profit_cum = info.get('profit_cum', 0.0) # 累積収益
             self.writer.add_scalar("ep_cost", ep_costs, itr)
+            self.writer.add_scalar("ep_shaped_r", ep_shaped_r, itr)
+            self.writer.add_scalar("ep_profit_cum", ep_profit_cum, itr)
+            self.writer.add_scalar("ep_reward_scale", ep_reward_scale, itr)
             self.writer.add_scalar("ep_reward", ep_reward, itr)
-            self.writer.add_scalar("ep_profit", ep_profit, itr)
-            self.writer.add_scalar("ep_action_sum", ep_action_sum, itr)
             self.writer.add_scalar("dual_lambda", self.dual_lambda.mean(), itr)
             ## -------------------------------------------------------
 
@@ -280,37 +301,34 @@ class MCEICRLTrainer:
         output: E_π or E_D[φ_ζ(τ)] : 期待値
         """
         total_feature = torch.zeros(self.feature_dim, device = self.device)
-        expert_num_rollouts = 0
+        expert_rollouts = 0
 
         current = self.expert_start
         while current <= self.expert_end:
-            date_str = current.strftime("%Y-%m-%d")
-            file_name = f"{date_str}_dp.pkl"
-            file_path = os.path.join(self.expert_path, file_name)
-            if os.path.isfile(file_path):
-                with open(os.path.join(self.expert_path, "2022-09-04_dp.pkl"), 'rb') as f:
+            file_path = self.expert_subdir / f"{current:%Y-%m-%d}_dp.pkl"
+            if file_path.is_file():
+                with open(file_path, 'rb') as f:
                     data = pickle.load(f)
-                obs = data['observations']
-                acts = data['actions']
-                discounted_sum = torch.zeros(self.feature_dim, device = self.device)
-                for t in range(len(obs)): # t=0,...,47(48ステップ)
-                    s_t = torch.tensor(obs[t], dtype = torch.float32, device = self.device)
-                    a_t = torch.tensor(acts[t], dtype = torch.float32, device = self.device)
-                    phi_zeta = self.zeta_net(s_t, a_t)
-                    discounted_sum += (gamma ** t) * phi_zeta
-                total_feature += discounted_sum
-                expert_num_rollouts += 1
-            current += timedelta(days=1) # 日付を1日進める
 
-            if expert_num_rollouts == 0:
-                sys.stderr.write(
-                    f"Error: 指定された日付範囲 {self.expert_start.strftime('%Y-%m-%d')}〜"
-                    f"{self.expert_end.strftime('%Y-%m-%d')} の間に"
-                    f"一件も「*_dp.pkl」ファイルが見つかりませんでした。\n"
-                )
-                sys.exit(1)
+                s_batch = torch.as_tensor(data["observations"], device=self.device)
+                a_batch = torch.as_tensor(data["actions"], device=self.device)
+                with torch.no_grad():
+                    phi = self.zeta_net(s_batch, a_batch)
+                    summed_phi = phi.sum(dim=0)
 
-        return total_feature / expert_num_rollouts
+                total_feature += summed_phi
+                expert_rollouts += 1
+            current += timedelta(days=1)
+
+        if expert_rollouts == 0:
+            sys.stderr.write(
+                f"Error: 指定された日付範囲 {self.expert_start.strftime('%Y-%m-%d')}〜"
+                f"{self.expert_end.strftime('%Y-%m-%d')} の間に"
+                f"一件も「*_dp.pkl」ファイルが見つかりませんでした。\n"
+            )
+            sys.exit(1)
+
+        return total_feature / expert_rollouts
     
     def save(self, ckpt_path: str):
         torch.save({
@@ -320,8 +338,10 @@ class MCEICRLTrainer:
             "zeta_net":     self.zeta_net.state_dict(),
             "dual_lambda":  self.dual_lambda,
         }, ckpt_path)
+        print(f"Checkpoint saved to {ckpt_path}")
 
     def load(self, ckpt_path: str):
+        print(f"Loading checkpoint from {ckpt_path}...")
         ckpt = torch.load(ckpt_path, map_location=self.device)
         self.policy.load_state_dict(ckpt["policy"])
         self.q.load_state_dict(ckpt["q"])
@@ -329,6 +349,7 @@ class MCEICRLTrainer:
         self.zeta_net.load_state_dict(ckpt["zeta_net"])
         self.dual_lambda = ckpt["dual_lambda"].to(self.device)
 
+    # 推論フェーズ
     def run_inference_range(self, csv_path, start_date, end_date, plot_dir):
         #  データ読み込み & 対象期間のフィルタリング
         print(f"Loading data from {csv_path} for the period {start_date} to {end_date}... \n")
@@ -336,31 +357,47 @@ class MCEICRLTrainer:
         # 推論用のデータフレームをセット
         trainer.env.set_inference_df(df)
         obs = trainer.env.inference_reset()
-        results, cum_opt , cum_base = [], 0.0, 0.0
-        
+        results, cum_total_RL, cum_total_base = [], 0.0, 0.0
+
+        prev_date = None
+        start_cum_RL_for_day, start_cum_base_for_day = 0.0, 0.0
+
         for idx, row in enumerate(df.itertuples(index=False)): # idx=0,1,...,end_idx, row=各行のデータ
             price = row.price
             pv = row.PVout
+            dp_cum = row.CumRev_Optimal
+            # --- 日付変更時にRL, Baseline収益をリセット ---
+            if row.date != prev_date:
+                prev_date = row.date
+                start_cum_RL_for_day = cum_total_RL
+                start_cum_base_for_day = cum_total_base
             # --- 行動決定 ---
             obs_tensor = torch.tensor(obs, dtype=torch.float32, device=trainer.device)
             with torch.no_grad():
                 action = trainer.policy.act(obs_tensor)
             action_np = action.cpu().numpy()
-
             # --- ステップ収益計算 ---
-            cum_opt += step_opt_profit(price, pv, action_np[0])
-            cum_base += step_base_profit(price, pv)
+            cum_total_RL += step_opt_profit(price, pv, action_np[0])
+            cum_total_base += step_base_profit(price, pv)
+
+            daily_cum_RL = cum_total_RL - start_cum_RL_for_day
+            daily_cum_base = cum_total_base - start_cum_base_for_day
+            daily_gap    = dp_cum - daily_cum_RL
+            gap_pct      = daily_gap / dp_cum * 100 if dp_cum else float("nan")
 
             # --- 結果記録 ---
             results.append({
-                "date":                     row.date,
-                "hour":                     row.hour,
-                "battery_soc":        obs[3] * trainer.battery_capacity,
-                "pvout":              pv,
-                "price" :         price,
-                "action":             action_np[0],
-                "cumrev_optimal":     cum_opt,
-                "cumrev_baseline" :   cum_base,
+                "date":             row.date,
+                "hour":             row.hour,
+                "battery_soc":      obs[3] * trainer.battery_capacity,
+                "pvout":            pv,
+                "price" :           price,
+                "action":           action_np[0],
+                "cumrev_agent":     daily_cum_RL,
+                "cumrev_dp":        dp_cum,
+                "gap":              daily_gap,
+                "gap_pct":          gap_pct,
+                "cumrev_baseline" : daily_cum_base,
             })
 
             # --- 環境ステップ ---
@@ -373,66 +410,79 @@ class MCEICRLTrainer:
         plot_dir.mkdir(parents=True, exist_ok=True)
         df_out.to_csv(plot_dir / "inference_result.csv", index=False)
 
+        # --- DP全期間累積収益を日付ごとに集計 ---
+        # 各日(date)の最終 cumrev_dp を取り、それらを合計する
+        dp_cum_total = df_out.groupby("date")["cumrev_dp"].max().sum()
+
         # --- 累積収益等を可視化 ---
         plot_schedule(df_out, f"{start_date} ~ {end_date}", plot_dir / "schedule.png")
+        diff = cum_total_RL - cum_total_base
+        pct  = diff / cum_total_base * 100 if cum_total_base else float("nan")
 
-        diff = cum_opt - cum_base
-        pct  = diff / cum_base * 100 if cum_base else float("nan")
+        final_gap     = cum_total_RL - dp_cum_total
+        final_gap_pct = final_gap / dp_cum_total * 100 if dp_cum_total else float("nan")
 
         print("================ SUMMARY ================")
-        print(f"Period             : {start_date} → {end_date}")
-        print(f"Baseline revenue   : {cum_base:.2f} Yen")
-        print(f"Optimised revenue  : {cum_opt:.2f} Yen")
-        print(f"Difference         : {diff:+.2f} Yen  ({pct:+.1f} %)")
+        print(f"Period                      : {start_date} → {end_date}")
+        print(f"Baseline revenue            : {cum_total_base:.2f} Yen")
+        print(f"DP optimum                  : {dp_cum_total:.2f} Yen")
+        print(f"RL Agent revenue            : {cum_total_RL:.2f} Yen")
+        print(f"Difference (RL-Base)        : {diff:+.2f} Yen  ({pct:+.1f} %)")
+        print(f"Difference (RL-DP)          : {final_gap:.2f} Yen  ({final_gap_pct:+.1f} %)")
         print("=========================================")
+
+        print_daily_comparison(df_out)
+        plot_daily_revenue_comparison(df_out, plot_dir / "daily_revenue_comparison.png")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # =======================================================
     # Training settings
     # =======================================================
-    parser.add_argument('--n_iters', type=int, default=2500, help="エピソード数(学習日数)")
+    parser.add_argument('--n_iters', type=int, default=12000, help="エピソード数(学習日数)")
     parser.add_argument('--battery_capacity', type=float, default=4.0, help="蓄電池の容量")
     parser.add_argument('--day_steps', type=int, default=48, help="1日のステップ数")
     parser.add_argument('--obs_dim', type=int, default=6, help="観測空間の次元数")
     parser.add_argument('--act_dim', type=int, default=1, help="行動空間の次元数")
-    parser.add_argument('--num_nominal_trajectories', type=int, default=10, help="nominal policyのロールアウト数")
+    parser.add_argument('--num_nominal_trajectories', type=int, default=30, help="nominal policyのロールアウト数")
     parser.add_argument('--batch_size', type=int, default=48, help="バッチサイズ")
-    parser.add_argument('--buffer_size', type=int, default=192, help="バッファのサイズ")
+    parser.add_argument('--buffer_size', type=int, default=9600, help="バッファのサイズ")
+    parser.add_argument('--learning_starts', type=int, default=720, help='ReplayBufferに何ステップ溜めてから学習を開始するか')
     # =======================================================
     # Hyperparameters
     # =======================================================
-    parser.add_argument('--policy_lr', type=float, default=3e-5)
-    parser.add_argument('--qf_lr', type=float, default=3e-4)
+    parser.add_argument('--policy_lr', type=float, default=2e-4)
+    parser.add_argument('--qf_lr', type=float, default=8e-4)
     parser.add_argument('--ent_coef', type=float, default=0.0001, help="エントロピー重み")
-    parser.add_argument('--tau', type=float, default=0.005)
-    parser.add_argument('--reward_gamma', type=float, default=0.8)
+    parser.add_argument('--tau', type=float, default=1e-4)
+    parser.add_argument('--reward_gamma', type=float, default=0.97)
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--lambda_init', type=float, default=1.0)
-    parser.add_argument('--dual_lambda_lr', type=float, default=1e-3, help="dual λ の学習率")
+    parser.add_argument('--dual_lambda_lr', type=float, default=5e-4, help="dual λ の学習率")
     parser.add_argument('--feature_dim', type=int, default=128, help="特徴空間の次元数")
-    parser.add_argument('--alpha_k', type=float, default=0.001, help="制約閾値 αₖ（ϕ の許容差）")
+    parser.add_argument('--alpha_k', type=float, default=0.0001, help="制約閾値 αₖ（ϕ の許容差）")
     parser.add_argument('--zeta_lr', type=float, default=3e-4, help="ζ ネットワークの学習率")
     # =======================================================
-    # Training data settings
+    # Training settings
     # =======================================================
-    parser.add_argument('--train_data_path', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/data_for_ICRL/train_data/only0905_PV4.csv', help="学習データのパス")
-    parser.add_argument('--expert_path', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/EXPERT')
-    parser.add_argument('--expert_start_date', type=str, default='2022-09-04', help="エキスパートデータの開始日")
-    parser.add_argument('--expert_end_date', type=str, default='2022-09-04', help="エキスパートデータの終了日")
-    parser.add_argument('--checkpoint_path', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/checkpoints/mce_icrl_checkpoint.pth', help="学習モデルの保存先")
+    parser.add_argument('--train_data_path', type=Path, default=TRAINDATA_DIR / 'train_data_2022-09-01~2022-09-30.csv', help="学習データのパス")
+    parser.add_argument('--expert_path', type=Path, default=ICRL_DIR / 'EXPERT')
+    parser.add_argument('--expert_start_date', type=str, default='2022-09-01', help="エキスパートデータの開始日")
+    parser.add_argument('--expert_end_date', type=str, default='2022-09-30', help="エキスパートデータの終了日")
+    parser.add_argument('--save_checkpoint_path', type=Path, default=ICRL_DIR / 'checkpoints/mce_icrl_checkpoint.pth', help="学習モデルの保存先")
     # =======================================================
     # Inferencce settings
     # =======================================================
-    parser.add_argument('--inference_input_csv', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/data_for_ICRL/inference_data/only0905_PV4.csv', help="推論入力CSVファイルのパス")
-    parser.add_argument('--inference_output', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/data_for_ICRL/inference_data/output.csv', help="推論出力CSVファイルのパス")
-    parser.add_argument('--inference_start_date', type=str, default='2022-09-05', help="推論開始日")
-    parser.add_argument('--inference_end_date', type=str, default='2022-09-05', help="推論終了日")
-    parser.add_argument('--inference_result_dir', type=str, default='Battery-Control-By-Reinforcement-Learning/MCEICRL/results/inference_result', help="推論結果の保存ディレクトリ")
+    parser.add_argument('--load_checkpoint_path', type=Path, default=ICRL_DIR / 'checkpoints/2022-09-01~2022-09-30_maxgap.pth', help="学習モデルの保存先")
+    parser.add_argument('--inference_input_csv', type=Path, default=DATA_DIR / 'inference_data/train_data_2022-01-01~2022-01-31.csv', help="推論入力CSVファイルのパス")
+    parser.add_argument('--inference_output', type=Path, default=DATA_DIR / 'inference_data/output.csv', help="推論出力CSVファイルのパス")
+    parser.add_argument('--inference_start_date', type=str, default='2023-01-01', help="推論開始日")
+    parser.add_argument('--inference_end_date', type=str, default='2023-01-31', help="推論終了日")
+    parser.add_argument('--inference_result_dir', type=Path, default=ICRL_DIR / 'results/inference_result', help="推論結果の保存ディレクトリ")
     # =======================================================
     # Mode setting
     # =======================================================
-    parser.add_argument('--mode', type=str, choices=['train', 'inference'], default='train', help='実行モード')
+    parser.add_argument('--mode', type=str, choices=['train', 'inference'], default='inference', help='実行モード')
 
     # =======================================================
     # ConstraintNet settings
@@ -446,10 +496,10 @@ if __name__ == '__main__':
 
     if args.mode == "train":
         trainer.train()
-        trainer.save(args.checkpoint_path)
+        trainer.save(args.save_checkpoint_path)
 
     elif args.mode == "inference":
-        trainer.load(args.checkpoint_path)
+        trainer.load(args.load_checkpoint_path)
         trainer.run_inference_range(
             csv_path=args.inference_input_csv,
             start_date=args.inference_start_date,

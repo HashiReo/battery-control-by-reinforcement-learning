@@ -27,6 +27,7 @@ class BatteryEnv(gym.Env):
 
         # 学習用データフレームの取得
         self.df_train = get_train_df(train_data_path)
+        self.df_raw = pd.read_csv(train_data_path)
         # 推論用データフレーム
         self.df_infer: pd.DataFrame
         # self.pvout_max = self.df_train['PVout'].max()
@@ -46,24 +47,49 @@ class BatteryEnv(gym.Env):
         self.df_train['price'] = normalize(self.df_train["price"], self.price_max, self.price_min)
         self.df_train['imbalance'] = normalize(self.df_train["imbalance"], self.imbalance_max, self.imbalance_min)
 
+        self.rl_cum = 0.0  # RL累積報酬
+
         # zeta_netのインスタンス化
         self.zeta_net = FeatureEncoder(obs_dim, act_dim, feature_dim)
 
-    def _get_reward(self, action, state_idx):
+    def step_profit(self, action, state_idx):
         pv_gen_normalized = self.df_train.loc[state_idx, "PVout"]  # PV発電実績値（正規化済み）
         pv_gen = denormalize(pv_gen_normalized, self.pvout_max, self.pvout_min) # PV発電実績値（非正規化）
         energyprice_normalized = self.df_train.loc[state_idx, "price"]  # 電力価格実績値（正規化済み）
         energy_price = denormalize(energyprice_normalized, self.price_max, self.price_min) # 電力価格実績値（非正規化）
         imbalance_price_normalized = self.df_train.loc[state_idx, "imbalance"] # インバランス価格実績値（正規化済み）
         imbalance_price = denormalize(imbalance_price_normalized, self.imbalance_max, self.imbalance_min) # インバランス価格実績値（非正規化）
-        deal_energy = pv_gen + action # [kWh] + [kWh]
-        deal_profit = deal_energy * energy_price
-        return deal_profit
+
+        step_energy = pv_gen + action
+        step_profit = step_energy * energy_price
+        return step_profit
+
+    def _get_reward(self, action, state_idx):
+        tau = 0.05 * self.G_max # 最適収益の残り5%からギアを挙げる
+        K = 10.0 # ブースト倍率
+        step_profit = self.step_profit(action, state_idx)
+        self.RL_cum += step_profit
+        G_t = self.df_raw.at[state_idx, "CumRev_Optimal"]
+        gap_t = max(0.0, G_t - self.RL_cum) # もしかしたらabsでもよいかも
+        reward = (self.prev_gap - gap_t) / self.G_max
+        # reward = (self.prev_gap - gap_t / (self.prev_gap + 1e-6))
+        self.prev_gap = gap_t
+        if reward < tau:
+            reward *= K
+            
+        return reward, self.RL_cum
 
     # reset, stepは仮で実装
     def reset(self)-> Tuple[np.ndarray, int]:
+        self.rl_cum = 0.0
         # ランダムな初期値を生成
         initial_soc, state_idx, sin_time, cos_time = make_random_state(self.df_train, self.day_steps)
+        date = self.df_raw.loc[state_idx, "date"]
+        self.day_mask = self.df_raw["date"] == date
+        self.G_max = float(self.df_raw.loc[self.day_mask, "CumRev_Optimal"].iloc[-1])
+        self.RL_cum = 0.0
+        self.prev_gap = self.G_max
+
         # 初期日付の観測値を取得
         obs = np.array([
             # PVout, price, imbalanceは予測値であるべきでは？現在は実測値を予測値として使用している
@@ -80,7 +106,7 @@ class BatteryEnv(gym.Env):
     def step(self, action, obs, battery_capacity, state_idx, dual_lambda):
         _current_soc = obs[3] * battery_capacity  # SoCをkWhに変換
         next_soc = (_current_soc - action)/battery_capacity # [kWh]-[kWh]->正規化
-        reward = np.asarray([self._get_reward(action, state_idx)], dtype=np.float32)
+        reward, profit_cum = self._get_reward(action, state_idx)
 
         # φ_ζ(s,a)の計算
         s_t = torch.tensor(obs, dtype=torch.float32
@@ -99,7 +125,8 @@ class BatteryEnv(gym.Env):
         done = (self.df_train.at[state_idx,"hour"] == 23.5)
         state_idx += 1 if not done else 0
         info = {"cost": cost,
-                "state_idx": state_idx
+                "state_idx": state_idx,
+                "profit_cum": profit_cum,
                 }
 
         sin_time, cos_time = get_time_data(state_idx, self.day_steps)
