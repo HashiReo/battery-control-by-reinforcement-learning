@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard.writer import SummaryWriter
+from torch.utils.data import DataLoader, TensorDataset
 import pickle
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -28,36 +29,6 @@ TRAINDATA_DIR = ICRL_DIR / "data_for_ICRL" / "train_data" # .../MCEICRL/data_for
 def soft_update(target: nn.Module, source: nn.Module, tau: float):
     for t, s in zip(target.parameters(), source.parameters()):
         t.data.copy_(tau * s.data + (1 - tau) * t.data)
-    
-# def train_autoencoder(encoder, decoder, dataloader, epoch=10, lr=1e-3):
-#     encoder.train(); decoder.train()
-#     optim_ae = torch.optim.Adam(
-#         list(encoder.parameters())+list(decoder.parameters()), lr=lr
-#     )
-#     loss_fn =nn.MSELoss()
-#     for ep in range(epochs):
-#         total = 0.0
-#         for s_batch, a_batch in dataloader:
-#             s_batch = s_batch.to(device); a_batch = a_batch.to(device)
-#             z = encoder(s_batch, a_batch)
-#             recon = decoder(z)
-#             target = torch.cat([s_batch, a_batch], dim=-1)
-#             loss = loss_fn(recon, target)
-#             optim_ae.zero_grad();loss.backward(); optim_ae.step()
-#             total += loss.item()
-#         print(f"[AE] Epoch {ep+1}, Recon Loss: {total:.4f}")
-
-# def create_ae_dataloader(trajectories, batch_size=64):
-#     all_s, all_a = [], []
-#     for traj in trajectories:
-#         for s, a in traj:
-#             all_s.append(torch.tensor(s, dtype=torch.float32))
-#             all_a.append(torch.tensor(a, dtype=torch.float32))
-#     ds = torch.utils.data.TensorDataset(
-#         torch.stack(all_s), torch.stack(all_a)
-#     )
-#     return torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
-
 
 class MCEICRLTrainer:
     def __init__(self, config):
@@ -101,6 +72,9 @@ class MCEICRLTrainer:
         )
         self.dual_lambda_lr  = config.dual_lambda_lr
         self.budget_phi      = config.alpha_k
+        self.lambda_update_interval = config.lambda_update_interval
+        self.lambda_clip_max = config.lambda_clip_max
+        self.reward_scale = config.reward_scale
         # Hyperparams
         self.gamma = config.reward_gamma # 割引率
         self.alpha = config.ent_coef # エントロピー重み
@@ -127,20 +101,19 @@ class MCEICRLTrainer:
                 f"エキスパートのデータが見つかりません: {self.expert_subdir}"
             )
         
-        # π(a|s)ネットワーク
+        # --- π(a|s)ネットワーク---
         self.policy = GaussianPolicy(obs_dim, act_dim, self.battery_capacity).to(self.device)
         self.policy_opt = optim.Adam(self.policy.parameters(), lr=config.policy_lr) # parameters()に含まれるテンソル群がθ(重み＆バイアス)にあたる
-
-        # Q(s,a)ネットワーク
+        # --- Q(s,a)ネットワーク ---
         self.q = QNetwork(obs_dim, act_dim).to(self.device)
         self.target_q = QNetwork(obs_dim, act_dim).to(self.device)
         self.q_opt = optim.Adam(self.q.parameters(), lr=config.qf_lr)
-
-        # ζネットワーク（特徴表現）
+        # --- ζネットワーク（特徴表現）---
+        self.zeta_lr = config.zeta_lr # ζネットワークの学習率
         self.zeta_net = FeatureEncoder(obs_dim, act_dim, self.feature_dim).to(self.device)
-        self.zeta_opt = optim.Adam(self.zeta_net.parameters(), lr=config.zeta_lr)
-        
-        # Replay buffer
+        self.env.zeta_net = self.zeta_net
+        self.zeta_opt = optim.Adam(self.zeta_net.parameters(), lr=self.zeta_lr)
+        #  --- Replay buffer ---
         # オフポリシー学習用に経験を蓄積
         self.buffer = ReplayBuffer(
             config.buffer_size, # バッファのサイズ
@@ -148,7 +121,83 @@ class MCEICRLTrainer:
             action_space=self.env.action_space, # 環境と同じ行動空間
             device=self.device, # デバイス
         )
+        # --- 事前学習用パラメータ ---
+        self.pretrain_epochs = config.pretrain_epochs
+        self.pretrain_batch_size = config.pretrain_batch_size
+        self.pretrain_lr = config.pretrain_lr
+        self.pretrain_rollouts = config.pretrain_initialnominal_rollouts
+        # --- Decoder ---
+        self.decoder = FeatureDecoder(obs_dim, act_dim, self.feature_dim).to(self.device)
+        # --- TensorBoardの設定 ---
         self.writer = SummaryWriter(str(ICRL_DIR / "logs")) 
+
+    def _pretrain_autoencoder(self, epochs:int, batch_size:int):
+        print("--- Starting Autoencoder Pre-training ---")
+        # 1) 各データを収集
+        expert_trajectories = self._collect_expert_trajectories()
+        nominal_trajectories = self._collect_initial_nominal_trajectories(rollouts=self.pretrain_rollouts)
+        # 2) データを統合
+        all_trajectories = expert_trajectories + nominal_trajectories
+        # 3) データで学習
+        dataloader = self._make_ae_dataloader(all_trajectories, batch_size)
+        self.train_autoencoder(self.zeta_net, self.decoder, dataloader, epochs=epochs, lr=self.pretrain_lr)
+        print("--- Finished Autoencoder Pre-training ---")
+
+    # --- エキスパートの軌道を収集 ---
+    def _collect_expert_trajectories(self):
+        pairs = []
+        date = self.expert_start
+        while date <= self.expert_end:
+            pkl = self.expert_subdir / f"{date:%Y-%m-%d}_dp.pkl"
+            if pkl.is_file():
+                with open(pkl, "rb") as f:
+                    d = pickle.load(f)
+                pairs.extend(zip(d["observations"], d["actions"]))
+            date += timedelta(days=1)
+        print(f"[AE] expert pairs : {len(pairs):,}")
+        return pairs
+    
+    # --- 初期のnominal policyの軌道を収集 ---
+    def _collect_initial_nominal_trajectories(self, rollouts:int):
+        pairs = []
+        obs, idx = self.env.reset()
+        for _ in range(rollouts):
+            act = self.env.action_space.sample() # ランダム行動
+            pairs.append((obs.copy(), act.copy()))
+            obs, _, done, info = self.env.step(act, obs, self.battery_capacity, idx, self.dual_lambda)
+            if done: break
+        print(f"[AE] nominal pairs : {len(pairs):,}")
+        return pairs
+    
+    def _make_ae_dataloader(self, pairs, batch_size):
+        if not pairs:
+            return None
+        s_np = np.stack([p[0] for p in pairs]).astype(np.float32)
+        a_np = np.stack([p[1] for p in pairs]).astype(np.float32)
+        ds = TensorDataset(torch.from_numpy(s_np), torch.from_numpy(a_np))
+        return DataLoader(ds, batch_size=batch_size, shuffle=True, pin_memory=True)
+    
+    def train_autoencoder(self, encoder, decoder, dataloader, epochs, lr, device='cpu'):
+        if dataloader is None:
+            print("[AE] no data → skip pre-train"); return
+        decoder = decoder.to(device)
+        opt = torch.optim.Adam(
+            list(encoder.parameters()) + list(decoder.parameters()), lr=lr
+        )
+        loss_fn = nn.MSELoss()
+        encoder.train(); decoder.train()
+        for ep in range(epochs):
+            tot = 0.0
+            for s_b, a_b in dataloader:
+                s_b, a_b = s_b.to(device), a_b.to(device)
+                z = encoder(s_b, a_b)
+                out = decoder(z)
+                tgt = torch.cat([s_b, a_b], dim=-1)
+                loss= loss_fn(out, tgt)
+                opt.zero_grad(); loss.backward(); opt.step()
+                tot += loss.item() * len(s_b)
+            print(f"[AE] epoch {ep+1:2d}/{epochs} recon={tot/len(dataloader.dataset):.4f}")
+        print("[AE] pre-training done. \n")
 
     # ラグランジュ乗数(λ)の更新
     def update_lambda(self, expert_phi, policy_phi):
@@ -160,13 +209,22 @@ class MCEICRLTrainer:
         Args:
             expert_phi, policy_phi: k次元ベクトル
         """
+        # with torch.no_grad():
+        #     grad = expert_phi.detach() - policy_phi.detach() - self.budget_phi # 全てk次元ベクトル
+        #     self.dual_lambda.add_((self.dual_lambda_lr * grad)) # λの更新
+        #     self.dual_lambda.clamp_(0.0, self.lambda_clip_max) # λのクリッピング
+        
         with torch.no_grad():
-            grad = expert_phi.detach() - policy_phi.detach() - self.budget_phi # 全てk次元ベクトル
-            self.dual_lambda .add_((self.dual_lambda_lr * grad)) # λの更新
-            self.dual_lambda.clamp_(min=0.0)
+            abs_diff = torch.abs(expert_phi - policy_phi)
+            grad = abs_diff - self.budget_phi
+            self.dual_lambda.add_((self.dual_lambda_lr * grad))
+            self.dual_lambda.clamp_(0.0, self.lambda_clip_max)
             
 
     def train(self):
+        # Autoencoderの事前学習
+        self._pretrain_autoencoder(epochs=self.pretrain_epochs, batch_size=self.pretrain_batch_size)
+
         self.nominal_policy_trajectories = deque(maxlen = self.num_nominal_trajectories)
         global_step = 0
 
@@ -180,10 +238,10 @@ class MCEICRLTrainer:
                     action, logp = self.policy.sample(obs_tensor) # nominal policyから行動をサンプリング
                 action_np = action.cpu().numpy() # 行動をnumpy配列に変換
                 next_obs, reward, done, info = self.env.step(action_np, obs, self.battery_capacity, state_idx, self.dual_lambda) # 環境を1ステップ進める, reward = 環境即時報酬(収益)
-                cost = info.get('cost', 0.0) # コストを取得, C(st, at) = λ^T φ_ζ(st, at)
+                cost = info.get('cost', 0.0) / self.feature_dim # コストを取得, C(st, at) = λ^T φ_ζ(st, at)
                 state_idx = info.get('state_idx', state_idx) # ステップ数を更新
 
-                shaped_r = 100*reward - cost # reward = 環境即時報酬, cost = λ^T φ_ζ(st, at)
+                shaped_r = self.reward_scale * reward - cost # reward = 環境即時報酬, cost = λ^T φ_ζ(st, at)
                 infos=[{}] # bufferのエラー対応でいったん仮設定
                 self.buffer.add(
                     obs,
@@ -201,8 +259,12 @@ class MCEICRLTrainer:
                 self.writer.add_scalar("action", action_np[0], global_step) # TensorBoardに行動を記録
                 self.writer.add_scalar("reward", reward, global_step) # TensorBoardに報酬を記録
                 self.writer.add_scalar("cost", cost, global_step) # TensorBoardにコストを記録
+                phi_mean = info.get('phi_zeta_mean', 0.0)
+                phi_std = info.get('phi_zeta_std', 0.0)
+                self.writer.add_scalar("phi_zeta/mean", phi_mean, global_step)
+                self.writer.add_scalar("phi_zeta/std", phi_std, global_step)
                 ep_shaped_r += float(shaped_r)
-                ep_reward_scale += 100*float(reward)
+                ep_reward_scale += self.reward_scale*float(reward)
                 ep_reward += float(reward)
                 ep_costs += cost
                 global_step += 1
@@ -215,20 +277,29 @@ class MCEICRLTrainer:
                     self._update_sac(batch)
 
             self.nominal_policy_trajectories.append(rollout) # 軌道を保存
-            # --- Dual λ & ζの更新 ---
-            # rolloutからpolicy_phiを計算
-            # policy_obs, policy_acs = zip(*rollout) # (s, a)のリスト, 状態と行動のリストを分離
-            policy_phi = self._compute_feature_expectation_from_nominal_trajectories() # nominal policyの軌道特徴量期待値を計算
-            expert_phi = self._compute_feature_expectation_from_expert_trajectories() # エキスパートの特徴量期待値を計算
+            # --- Dual λ & ζの更新(kエピソードに１回 and 方策更新まで待つ) ---
+            if itr % self.lambda_update_interval == 0 and itr >= self.learning_starts // self.n_steps:
+                policy_phi = self._compute_feature_expectation_from_nominal_trajectories()
+                expert_phi = self._compute_feature_expectation_from_expert_trajectories()
+                with torch.no_grad():
+                    # 差分ベクトル
+                    phi_diff = expert_phi - policy_phi
+                    # L2ノルム（ベクトルの大きさ）を計算
+                    phi_diff_norm = torch.linalg.norm(phi_diff).item()
+                    
+                    # TensorBoardに記録
+                    self.writer.add_scalar("phi_expectation/difference_norm", phi_diff_norm, itr)
+                    
+                    # (オプション) それぞれの期待値の大きさも記録すると、より詳細な分析ができます
+                    self.writer.add_scalar("phi_expectation/expert_norm", torch.linalg.norm(expert_phi).item(), itr)
+                    self.writer.add_scalar("phi_expectation/policy_norm", torch.linalg.norm(policy_phi).item(), itr)
+                    self.writer.add_scalar("phi_expectation/difference_sum", phi_diff.sum().item(), itr)
+                # --- λ 更新 ---
+                self.update_lambda(expert_phi, policy_phi)
+                # --- ζ 更新 ---
+                loss_zeta = torch.dot(self.dual_lambda.detach(), (expert_phi - policy_phi)) # スカラー積を得る
+                self.zeta_opt.zero_grad(); loss_zeta.backward(); self.zeta_opt.step()
 
-            # dual λの更新
-            self.update_lambda(expert_phi, policy_phi) # ラグランジュ乗数を更新
-
-            # ζネットワークの更新
-            loss_zeta = torch.dot(self.dual_lambda.detach(), (expert_phi - policy_phi)) # スカラー積を得る
-            self.zeta_opt.zero_grad()
-            loss_zeta.backward() # ζに関して勾配計算
-            self.zeta_opt.step() # ζを更新
             ## -------------------------------------------------------
             # Tensorboardに記録
             ep_profit_cum = info.get('profit_cum', 0.0) # 累積収益
@@ -272,7 +343,7 @@ class MCEICRLTrainer:
         # Q関数の更新
         soft_update(self.target_q, self.q, self.tau)
 
-    def _compute_feature_expectation_from_nominal_trajectories(self, gamma = 1.0):
+    def _compute_feature_expectation_from_nominal_trajectories(self, gamma = 0.99):
         """
         Trajectoriesから軌道特徴量期待値(E_π[φ_ζ(τ)])を計算
         input: trajectories: list of trajectories
@@ -285,16 +356,15 @@ class MCEICRLTrainer:
         
         total_feature = torch.zeros(self.feature_dim, device = self.device)
         for traj in self.nominal_policy_trajectories:          # ← deque に保持している複数日分
-            s_batch = torch.as_tensor([s for (s, _) in traj], device=self.device)
-            a_batch = torch.as_tensor([a for (_, a) in traj], device=self.device)
+            s_batch = torch.from_numpy(np.stack([s for (s, _) in traj], axis=0)).to(self.device)
+            a_batch = torch.from_numpy(np.stack([a for (_, a) in traj], axis=0)).to(self.device)
             T = s_batch.shape[0]                       # 48
             weights = (gamma ** torch.arange(T, device=self.device)).unsqueeze(1)
-            with torch.no_grad():
-                phi_zeta = self.zeta_net(s_batch, a_batch)
-                total_feature += (weights * phi_zeta).sum(dim=0)
+            phi_zeta = self.zeta_net(s_batch, a_batch)
+            total_feature = total_feature + (weights * phi_zeta).sum(dim=0)
         return total_feature / num_trajectories
        
-    def _compute_feature_expectation_from_expert_trajectories(self, gamma = 1.0):
+    def _compute_feature_expectation_from_expert_trajectories(self, gamma = 0.99):
         """
         Trajectoriesから軌道特徴量期待値(E_π[φ_ζ(τ)])を計算
         input: trajectories: list of trajectories
@@ -314,11 +384,10 @@ class MCEICRLTrainer:
                 a_batch = torch.as_tensor(data["actions"], device=self.device)
                 T = s_batch.shape[0]
                 weights = (gamma ** torch.arange(T, device=self.device)).unsqueeze(1)
-                with torch.no_grad():
-                    phi = self.zeta_net(s_batch, a_batch)
-                    discounted = (weights * phi).sum(dim=0)
+                phi = self.zeta_net(s_batch, a_batch)
+                discounted = (weights * phi).sum(dim=0)
 
-                total_feature += discounted
+                total_feature = total_feature + discounted
                 expert_rollouts += 1
             current += timedelta(days=1)
 
@@ -358,7 +427,6 @@ class MCEICRLTrainer:
         df = load_filtered_dataframe(csv_path, start_date, end_date)
         # 推論用のデータフレームをセット
         trainer.env.set_inference_df(df)
-        obs = trainer.env.inference_reset()
         results, cum_total_RL, cum_total_base = [], 0.0, 0.0
 
         prev_date = None
@@ -370,6 +438,7 @@ class MCEICRLTrainer:
             dp_cum = row.CumRev_Optimal
             # --- 日付変更時にRL, Baseline収益をリセット ---
             if row.date != prev_date:
+                obs = trainer.env.inference_reset(idx)
                 prev_date = row.date
                 start_cum_RL_for_day = cum_total_RL
                 start_cum_base_for_day = cum_total_base
@@ -441,28 +510,39 @@ if __name__ == '__main__':
     # =======================================================
     # Training settings
     # =======================================================
-    parser.add_argument('--n_iters', type=int, default=12000, help="エピソード数(学習日数)")
+    parser.add_argument('--n_iters', type=int, default=15000, help="エピソード数(学習日数)")
     parser.add_argument('--battery_capacity', type=float, default=4.0, help="蓄電池の容量")
     parser.add_argument('--day_steps', type=int, default=48, help="1日のステップ数")
     parser.add_argument('--obs_dim', type=int, default=6, help="観測空間の次元数")
     parser.add_argument('--act_dim', type=int, default=1, help="行動空間の次元数")
-    parser.add_argument('--num_nominal_trajectories', type=int, default=30, help="nominal policyのロールアウト数")
+    parser.add_argument('--num_nominal_trajectories', type=int, default=60, help="nominal policyのロールアウト数")
     parser.add_argument('--batch_size', type=int, default=48, help="バッチサイズ")
     parser.add_argument('--buffer_size', type=int, default=9600, help="バッファのサイズ")
     parser.add_argument('--learning_starts', type=int, default=720, help='ReplayBufferに何ステップ溜めてから学習を開始するか')
+    # =======================================================
+    # Pre-training settings
+    # =======================================================
+    pretrain_parser = parser.add_argument_group('Pre-training settings')
+    pretrain_parser.add_argument('--pretrain_epochs', type=int, default=20, help="Autoencoderの事前学習エポック数")
+    pretrain_parser.add_argument('--pretrain_batch_size', type=int, default=256, help="Autoencoderの事前学習バッチサイズ")
+    pretrain_parser.add_argument('--pretrain_lr', type=float, default=1e-3, help="Autoencoderの事前学習学習率")
+    pretrain_parser.add_argument('--pretrain_initialnominal_rollouts', type=int, default=240, help='事前学習のためにnominal policyで収集するロールアウト数')
     # =======================================================
     # Hyperparameters
     # =======================================================
     parser.add_argument('--policy_lr', type=float, default=2e-4)
     parser.add_argument('--qf_lr', type=float, default=8e-4)
-    parser.add_argument('--ent_coef', type=float, default=0.0001, help="エントロピー重み")
+    parser.add_argument('--ent_coef', type=float, default=1e-4, help="エントロピー重み")
     parser.add_argument('--tau', type=float, default=1e-4)
-    parser.add_argument('--reward_gamma', type=float, default=0.97)
+    parser.add_argument('--reward_gamma', type=float, default=0.99)
     parser.add_argument('--device', type=str, default='cpu')
-    parser.add_argument('--lambda_init', type=float, default=1.0)
-    parser.add_argument('--dual_lambda_lr', type=float, default=5e-4, help="dual λ の学習率")
+    parser.add_argument('--lambda_init', type=float, default=1.0, help="dual λ の初期値")
+    parser.add_argument('--dual_lambda_lr', type=float, default=1e-4, help="dual λ の学習率")
+    parser.add_argument('--lambda_update_interval', type=int, default=1, help="何エピソードごとにλ&ζを更新するか")
+    parser.add_argument('--lambda_clip_max', type=float, default=2.0, help="dual λの上限値")
+    parser.add_argument('--reward_scale', type=float, default=100.0, help="環境報酬倍率")
     parser.add_argument('--feature_dim', type=int, default=128, help="特徴空間の次元数")
-    parser.add_argument('--alpha_k', type=float, default=0.0001, help="制約閾値 αₖ（ϕ の許容差）")
+    parser.add_argument('--alpha_k', type=float, default=0.1, help="制約閾値 αₖ（ϕ の許容差）")
     parser.add_argument('--zeta_lr', type=float, default=3e-4, help="ζ ネットワークの学習率")
     # =======================================================
     # Training settings
@@ -484,7 +564,7 @@ if __name__ == '__main__':
     # =======================================================
     # Mode setting
     # =======================================================
-    parser.add_argument('--mode', type=str, choices=['train', 'inference'], default='inference', help='実行モード')
+    parser.add_argument('--mode', type=str, choices=['train', 'inference'], default='train', help='実行モード')
 
     # =======================================================
     # ConstraintNet settings
@@ -508,27 +588,3 @@ if __name__ == '__main__':
             end_date=args.inference_end_date,
             plot_dir=Path(args.inference_result_dir)
         )
-
-    # ─── オートエンコーダ事前学習 ───
-    # # (1) デコーダのインスタンス化
-    # feature_dim = args.feature_dim  # FeatureEncoder 側で定義しておく
-    # obs_dim = args.obs_dim
-    # act_dim = args.act_dim
-    # decoder = FeatureDecoder(feature_dim, obs_dim, act_dim).to(trainer.device)
-
-    # # (2) 学習用トラジェクトリを集める
-    # #    expert_dataは trainer が保持している expert_obs, expert_acs を
-    # #    [(s,a),(s,a)...] のリストに変換したものと、
-    # #    nominal_policy_trajectories（deque）を組み合わせ
-    # expert_trajs = list(zip(trainer.expert_obs, trainer.expert_acs))
-    # nominal_trajs = list(trainer.nominal_policy_trajectories)
-    # ae_loader = create_ae_dataloader(expert_trajs + nominal_trajs,
-    #                                   batch_size=args.batch_size)
-
-    # # (3) 事前学習 実行
-    # train_autoencoder(trainer.zeta_net, decoder,
-    #                   ae_loader,
-    #                   epochs=20,
-    #                   lr=args.zeta_lr,
-    #                   device=trainer.device)
-    # ─────────────────────────────────

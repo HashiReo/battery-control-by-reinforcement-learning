@@ -34,21 +34,22 @@ class GaussianPolicy(nn.Module):
     def sample(self, obs):
         if obs.dim() == 1:
             obs = obs.unsqueeze(0)
-        dist = self._dist(obs)
-        x_t = dist.rsample()
-        y_t = torch.tanh(x_t)
+        dist = self._dist(obs) # 平均・分散を持つNormal分布
+        x_t = dist.rsample()   # サンプリング
+        y_t = torch.tanh(x_t)  # tanhで -1~1 に射影
 
         pv  = obs[:, 0:1]
         soc = obs[:, 3:4]  
         ## ---------------------------------------------
         # 充電上限値の計算, minimum(PVout, SoC空き容量)
-        remaining_soc = (1 - soc) * self.battery_capacity
-        pv_charge_limit = pv * self.battery_capacity * 0.5
-        max_charge = torch.minimum(pv_charge_limit, remaining_soc)
+        remaining_soc = (1 - soc) * self.battery_capacity            # SoCの空き容量[kWh]
+        pv_charge_limit = pv * self.battery_capacity * 0.5           # PV発電量[kWh]
+        max_charge = torch.minimum(pv_charge_limit, remaining_soc)   # 最大充電量 = min(PV発電量, SoC空き容量)
         # 放電上限値の計算, SoCの下限値を下回らない放電量
-        max_discharge = torch.minimum(soc*self.battery_capacity, torch.full_like(soc, self.battery_capacity*0.5))
+        max_discharge = torch.minimum(soc*self.battery_capacity,
+                                      torch.full_like(soc, self.battery_capacity*0.5)) # 最大放電量 = min(SoC残量, 1ステップで出せる最大放電量(50%cap))
         ## ---------------------------------------------
-        scale = torch.where(y_t < 0, max_charge, max_discharge)
+        scale = torch.where(y_t < 0, max_charge, max_discharge)      # y<0->充電, y>=0->放電 [kWh]
 
         action = y_t * scale
 
@@ -117,11 +118,13 @@ class FeatureEncoder(nn.Module):
         for dim in hidden_dims:
             layers += [nn.Linear(last_dim, dim), nn.ReLU()]
             last_dim = dim
-        layers += [nn.Linear(last_dim, feature_dim)]
+        layers += [nn.Linear(last_dim, feature_dim),
+                   nn.LayerNorm(feature_dim, elementwise_affine=False),
+                   nn.Sigmoid()]
         self.net = nn.Sequential(*layers)
         self.output_dim = feature_dim
 
     def forward(self, s, a):
         # s: (obs_dim,), a: (act_dim,)
         x = torch.cat([s, a], dim=-1)   # → (obs_dim+act_dim,)
-        return self.net(x)              # → (feature_dim,)
+        return self.net(x)          # → (feature_dim,)

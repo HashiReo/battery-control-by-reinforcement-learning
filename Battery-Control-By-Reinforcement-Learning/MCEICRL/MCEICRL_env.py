@@ -22,6 +22,7 @@ class BatteryEnv(gym.Env):
         low[3], high[3] = 0.0, 1.0
         # sin/cos_timeの範囲
         low[4:6], high[4:6] = -1.0, 1.0
+        # low[6], high[6] = 0.0, 1.0 # revenue, EXPERT, obsにrevenueを追加するときにコメント解除
         self.action_space = spaces.Box(low=-battery_capacity*0.5, high=battery_capacity*0.5, shape=(act_dim, ), dtype=np.float32)
         self.observation_space = spaces.Box(low = low, high = high, shape = (obs_dim, ), dtype=np.float32)
 
@@ -46,8 +47,6 @@ class BatteryEnv(gym.Env):
         self.df_train['PVout'] = normalize(self.df_train["PVout"], self.pvout_max, self.pvout_min)
         self.df_train['price'] = normalize(self.df_train["price"], self.price_max, self.price_min)
         self.df_train['imbalance'] = normalize(self.df_train["imbalance"], self.imbalance_max, self.imbalance_min)
-
-        self.rl_cum = 0.0  # RL累積報酬
 
         # zeta_netのインスタンス化
         self.zeta_net = FeatureEncoder(obs_dim, act_dim, feature_dim)
@@ -75,15 +74,14 @@ class BatteryEnv(gym.Env):
 
         return reward, self.RL_cum
 
-    # reset, stepは仮で実装
     def reset(self)-> Tuple[np.ndarray, int]:
-        self.rl_cum = 0.0
+        self.RL_cum = 0.0
+        CumRev_day_norm = 0.0
         # ランダムな初期値を生成
         initial_soc, state_idx, sin_time, cos_time = make_random_state(self.df_train, self.day_steps)
         date = self.df_raw.loc[state_idx, "date"]
         self.day_mask = self.df_raw["date"] == date
         self.G_max = float(self.df_raw.loc[self.day_mask, "CumRev_Optimal"].iloc[-1])
-        self.RL_cum = 0.0
         self.prev_gap = self.G_max
 
         # 初期日付の観測値を取得
@@ -96,6 +94,7 @@ class BatteryEnv(gym.Env):
             initial_soc, # 初期SoC
             sin_time, # 時間情報
             cos_time  # 時間情報
+            # CumRev_day_norm　# EXPERT, obsにrevenueを追加するときにコメント解除
         ], dtype=np.float32)
         return obs, state_idx
 
@@ -103,6 +102,7 @@ class BatteryEnv(gym.Env):
         _current_soc = obs[3] * battery_capacity  # SoCをkWhに変換
         next_soc = (_current_soc - action)/battery_capacity # [kWh]-[kWh]->正規化
         reward, profit_cum = self._get_reward(action, state_idx)
+        CumRev_day_norm = min(self.RL_cum / self.G_max, 1.0)
 
         # φ_ζ(s,a)の計算
         s_t = torch.tensor(obs, dtype=torch.float32
@@ -114,6 +114,9 @@ class BatteryEnv(gym.Env):
         
         # φ_ζ(s,a)
         phi_zeta = self.zeta_net(s_t, a_t)
+        with torch.no_grad():
+            phi_zeta_mean = phi_zeta.mean().item()
+            phi_zeta_std = phi_zeta.std().item()
 
         # C(s,a)=λ^T φ_ζ
         cost = torch.dot(dual_lambda, phi_zeta).item() # スカラー値に変換
@@ -123,6 +126,8 @@ class BatteryEnv(gym.Env):
         info = {"cost": cost,
                 "state_idx": state_idx,
                 "profit_cum": profit_cum,
+                "phi_zeta_mean": phi_zeta_mean,
+                "phi_zeta_std": phi_zeta_std
                 }
 
         sin_time, cos_time = get_time_data(state_idx, self.day_steps)
@@ -133,22 +138,29 @@ class BatteryEnv(gym.Env):
             next_soc, # 次のSoC
             sin_time,
             cos_time
+            # CumRev_day_norm # 日ごとの累積収益の正規化値
         ], dtype=np.float32)
 
         return next_obs, reward, done, info
     
     # 推論用reset関数
-    def inference_reset(self):
+    def inference_reset(self, idx:int):
         if self.df_infer is None:
             raise ValueError("[BatteryEnv] 推論用データフレームが設定されていません。先に set_inference_df() を呼び出してください。")
         initial_soc = 0.0
+        self.RL_cum = 0.0
+        CumRev_day_norm = 0.0
+        date = self.df_infer.loc[idx, "date"]
+        self.day_mask = self.df_infer["date"] == date
+        self.G_max = float(self.df_infer.loc[self.day_mask, "CumRev_Optimal"].iloc[-1])
         obs = np.array([
             self.df_infer.loc[0, "PVout_norm"], # 実測値
             self.df_infer.loc[0, "price_norm"], # 実測値
             self.df_infer.loc[0,  "imbalance_norm"], # 実測値
             initial_soc, # 初期SoC
-            0.0, # 時間情報
-            1.0  # 時間情報
+            0.0,  # 時間情報
+            1.0 # 時間情報
+            # CumRev_day_norm # 日ごとの累積収益の正規化値
         ], dtype=np.float32)
 
         return obs
@@ -157,6 +169,8 @@ class BatteryEnv(gym.Env):
     def inference_step(self, action, obs, battery_capacity, idx):
         _current_soc = obs[3] * battery_capacity
         next_soc = (_current_soc - action) / battery_capacity # [kWh]-[kWh]->正規化
+        self.RL_cum += self.step_profit(action, idx)
+        CumRev_day_norm = min(self.RL_cum / self.G_max, 1.0)
         # 次のindex
         next_idx = idx + 1
         if next_idx >= len(self.df_infer):
@@ -171,6 +185,7 @@ class BatteryEnv(gym.Env):
             next_soc, # 次のSoC
             sin_time,
             cos_time
+            # CumRev_day_norm # 日ごとの累積収益の正規化値
         ], dtype=np.float32)
         return next_obs, False
     
