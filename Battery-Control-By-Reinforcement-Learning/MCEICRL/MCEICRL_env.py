@@ -138,7 +138,7 @@ class BatteryEnv(gym.Env):
             next_soc, # 次のSoC
             sin_time,
             cos_time
-            # CumRev_day_norm # 日ごとの累積収益の正規化値
+            # CumRev_day_norm # 日ごとの累積収益の正規化値, # EXPERT, obsにrevenueを追加するときにコメント解除
         ], dtype=np.float32)
 
         return next_obs, reward, done, info
@@ -160,7 +160,7 @@ class BatteryEnv(gym.Env):
             initial_soc, # 初期SoC
             0.0,  # 時間情報
             1.0 # 時間情報
-            # CumRev_day_norm # 日ごとの累積収益の正規化値
+            # CumRev_day_norm # 日ごとの累積収益の正規化値, # EXPERT, obsにrevenueを追加するときにコメント解除
         ], dtype=np.float32)
 
         return obs
@@ -185,7 +185,7 @@ class BatteryEnv(gym.Env):
             next_soc, # 次のSoC
             sin_time,
             cos_time
-            # CumRev_day_norm # 日ごとの累積収益の正規化値
+            # CumRev_day_norm # 日ごとの累積収益の正規化値, # EXPERT, obsにrevenueを追加するときにコメント解除
         ], dtype=np.float32)
         return next_obs, False
     

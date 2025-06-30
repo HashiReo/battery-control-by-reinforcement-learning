@@ -146,7 +146,7 @@ def build_dataset_pkl(day_df: pd.DataFrame, sched: pd.DataFrame,
         soc_before,
         sin_t,
         cos_t
-        # rev_dp_norm
+        # rev_dp_norm, # EXPERT, obsにrevenueを追加するときにコメント解除
     ]).astype(np.float32)
     action_kw = sched["Charge/Discharge (kWh)"].to_numpy(float).reshape(-1, 1).astype(np.float32)
 
@@ -166,7 +166,7 @@ def build_dataset_pkl(day_df: pd.DataFrame, sched: pd.DataFrame,
         "PVout_norm", "price_norm", "imb_norm",
         "SOC_before", 
         "sin_t", "cos_t",
-        # "CumRev_DP_norm",
+        # "CumRev_DP_norm", # EXPERT, obsにrevenueを追加するときにコメント解除
         "action_kW",
         "CumRev_Optimal", "CumRev_Baseline"
     ]
